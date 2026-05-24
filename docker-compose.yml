@@ -1,0 +1,91 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: banking-db
+    environment:
+      POSTGRES_USER: ${DB_USER:-bankinguser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-bankingpass123}
+      POSTGRES_DB: ${DB_NAME:-banking_db}
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${DB_USER:-bankinguser}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - banking-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: banking-redis
+    ports:
+      - '6379:6379'
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - banking-network
+
+  # Application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: banking-app
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://${DB_USER:-bankinguser}:${DB_PASSWORD:-bankingpass123}@postgres:5432/${DB_NAME:-banking_db}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      PORT: 3000
+      HOST: 0.0.0.0
+    ports:
+      - '3000:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+      - ./dist:/app/dist
+    networks:
+      - banking-network
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:3000/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Adminer (Database management UI)
+  adminer:
+    image: adminer:latest
+    container_name: banking-adminer
+    ports:
+      - '8080:8080'
+    depends_on:
+      - postgres
+    networks:
+      - banking-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  banking-network:
+    driver: bridge

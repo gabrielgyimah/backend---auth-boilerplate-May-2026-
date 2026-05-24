@@ -1,0 +1,660 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================================
+// ENUMS - Define all enumerated types for the banking system
+// ============================================================================
+
+/// Role enumeration
+enum RoleType {
+  SUPER_ADMIN
+  SYSTEM_ADMIN
+  COMPLIANCE_OFFICER
+  BRANCH_MANAGER
+  CUSTOMER_SERVICE
+  AUDITOR
+  TELLER
+  OPERATIONS_MANAGER
+  LOAN_OFFICER
+  SUPPORT_AGENT
+  DEVELOPER
+  CUSTOMER
+  EMPLOYEE
+}
+
+
+/// OTP status enumeration
+enum OTPStatus {
+  PENDING
+  VERIFIED
+  EXPIRED
+  USED
+}
+
+/// OTP type enumeration
+enum OTPType {
+  EMAIL_VERIFICATION
+  PHONE_VERIFICATION
+  PASSWORD_RESET
+  TWO_FACTOR
+  LOGIN_VERIFICATION
+}
+
+/// Session status enumeration
+enum SessionStatus {
+  ACTIVE
+  EXPIRED
+  REVOKED
+  LOGGED_OUT
+}
+
+/// Device trust status enumeration
+enum DeviceTrustStatus {
+  TRUSTED
+  UNTRUSTED
+  PENDING_VERIFICATION
+}
+
+/// Security event type enumeration
+enum SecurityEventType {
+  LOGIN_SUCCESS
+  LOGIN_FAILURE
+  LOGOUT
+  PASSWORD_CHANGE
+  PASSWORD_RESET
+  MFA_ENABLED
+  MFA_DISABLED
+  TOKEN_REFRESH
+  SUSPICIOUS_ACTIVITY
+  ACCOUNT_LOCKED
+  PERMISSION_DENIED
+  DATA_ACCESS
+  RESOURCE_CREATED
+  RESOURCE_UPDATED
+  RESOURCE_DELETED
+  REGISTER
+  EMAIL_VERIFIED
+}
+
+/// Document type enumeration
+enum DocumentType {
+  NATIONAL_ID
+  PASSPORT
+  DRIVER_LICENSE
+  PROOF_OF_ADDRESS
+  BANK_STATEMENT
+  UTILITY_BILL
+}
+
+/// Document status enumeration
+enum DocumentStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+  EXPIRED
+}
+
+/// Audit action enumeration
+enum AuditAction {
+  CREATE
+  READ
+  UPDATE
+  DELETE
+  APPROVE
+  REJECT
+  SUBMIT
+  CANCEL
+  EXPORT
+  IMPORT
+}
+
+/// Notification type enumeration
+enum NotificationType {
+  TRANSACTION_ALERT
+  SECURITY_ALERT
+  ACCOUNT_UPDATE
+  SYSTEM_NOTIFICATION
+  PROMOTIONAL
+  OTP
+  VERIFICATION
+  ERROR_NOTIFICATION
+}
+
+/// Notification status enumeration
+enum NotificationStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+/// Currency code enumeration
+enum CurrencyCode {
+  USD
+  EUR
+  GBP
+  INR
+  JPY
+  AUD
+  CAD
+  CHF
+  CNY
+  SEK
+  NZD
+}
+
+// ============================================================================
+// CORE ENTITIES
+// ============================================================================
+
+/// System user model - Core authentication and identity entity
+model User {
+  id                     String                   @id @default(cuid())
+  uuid                   String                   @unique @default(cuid())
+  email                  String                   @unique
+  phone                  String?                  @unique
+  firstName              String
+  lastName               String
+  passwordHash           String
+  passwordChangedAt      DateTime?
+  passwordExpiresAt      DateTime?
+  passwordHistory        PasswordHistory[]
+  isEmailVerified        Boolean                  @default(false)
+  emailVerifiedAt        DateTime?
+  isPhoneVerified        Boolean                  @default(false)
+  phoneVerifiedAt        DateTime?
+  is2FAEnabled           Boolean                  @default(false)
+  twoFASecret            String?
+  isAccountLocked        Boolean                  @default(false)
+  accountLockedAt        DateTime?
+  accountLockedReason    String?
+  failedLoginAttempts    Int                      @default(0)
+  lastFailedLoginAt      DateTime?
+  lastLoginAt            DateTime?
+  lastLoginIp            String?
+  status                 Boolean                  @default(true)
+  roleId                 String
+  role                   Role                     @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  permissions            UserPermission[]
+  roles                  UserRole[]
+  sessions               Session[]
+  devices                Device[]
+  otpRequests            OTPRequest[]
+  refreshTokens          RefreshToken[]
+  passwordResetTokens    PasswordResetToken[]
+  emailVerificationTokens EmailVerificationToken[]
+  apiKeys                APIKey[]
+  auditLogs              AuditLog[]               @relation("AuditCreator")
+  updatedAuditLogs       AuditLog[]               @relation("AuditUpdater")
+  securityEvents         SecurityEvent[]
+  createdAt              DateTime                 @default(now())
+  updatedAt              DateTime                 @updatedAt
+  deletedAt              DateTime?
+  createdBy              String?
+  updatedBy              String?
+
+  @@index([email])
+  @@index([roleId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([email, firstName, lastName])
+}
+
+/// Role model - Define roles for RBAC
+model Role {
+  id          String           @id @default(cuid())
+  uuid        String           @unique @default(cuid())
+  name        RoleType
+  displayName String
+  description String?
+  permissions Permission[]
+  users       User[]
+  userRoles   UserRole[]
+  userPerms   UserPermission[]
+  isSystem    Boolean          @default(false)
+  isActive    Boolean          @default(true)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  deletedAt   DateTime?
+  createdBy   String?
+  updatedBy   String?
+
+  @@unique([name])
+  @@index([isSystem])
+  @@index([isActive])
+}
+
+/// Permission model - Fine-grained permission definitions
+model Permission {
+  id           String           @id @default(cuid())
+  uuid         String           @unique @default(cuid())
+  code         String           @unique // e.g., "users:create", "transactions:approve"
+  displayName  String
+  description  String?
+  module       String // e.g., "users", "transactions"
+  action       String // e.g., "create", "read", "update", "delete"
+  resourceType String? // e.g., "User", "Transaction"
+  roles        Role[]
+  users        UserPermission[]
+  isSystem     Boolean          @default(false)
+  isActive     Boolean          @default(true)
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  deletedAt    DateTime?
+  createdBy    String?
+  updatedBy    String?
+
+  @@unique([module, action])
+  @@index([module])
+  @@index([action])
+  @@index([isActive])
+}
+
+/// User-Role association for multi-role support
+model UserRole {
+  id         String    @id @default(cuid())
+  uuid       String    @unique @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roleId     String
+  role       Role      @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  assignedAt DateTime  @default(now())
+  assignedBy String?
+  revokedAt  DateTime?
+  revokedBy  String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@unique([userId, roleId])
+  @@index([userId])
+  @@index([roleId])
+}
+
+/// User-Permission association for granular permissions
+model UserPermission {
+  id           String     @id @default(cuid())
+  uuid         String     @unique @default(cuid())
+  userId       String
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permissionId String
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  roleId       String?
+  role         Role?      @relation(fields: [roleId], references: [id], onDelete: SetNull)
+  grantedAt    DateTime   @default(now())
+  grantedBy    String?
+  expiresAt    DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@unique([userId, permissionId])
+  @@index([userId])
+  @@index([permissionId])
+  @@index([roleId])
+}
+
+// ============================================================================
+// AUTHENTICATION & SESSION MANAGEMENT (FIXED)
+// ============================================================================
+
+/// Session model - Track user sessions (no plaintext token, linked to refresh token)
+model Session {
+  id             String        @id @default(cuid())
+  uuid           String        @unique @default(cuid())
+  userId         String
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokenId String        @unique // One session per refresh token
+  refreshToken   RefreshToken  @relation(fields: [refreshTokenId], references: [id], onDelete: Cascade)
+  deviceId       String?
+  device         Device?       @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  tokenHash      String        @unique // hashed refresh token (for lookup)
+  ipAddress      String
+  userAgent      String?
+  expiresAt      DateTime
+  status         SessionStatus @default(ACTIVE)
+  lastActivityAt DateTime      @default(now())
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  deletedAt      DateTime?
+
+  @@index([userId])
+  @@index([status])
+  @@index([expiresAt])
+  @@index([createdAt])
+  @@index([refreshTokenId])
+}
+
+/// Device model - Track user devices for security
+model Device {
+  id            String            @id @default(cuid())
+  uuid          String            @unique @default(cuid())
+  userId        String
+  user          User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name          String
+  deviceType    String // e.g., "mobile", "desktop", "tablet"
+  deviceOs      String?
+  deviceBrowser String?
+  fingerprint   String?
+  trustStatus   DeviceTrustStatus @default(UNTRUSTED)
+  lastUsedAt    DateTime?
+  isTrusted     Boolean           @default(false)
+  trustedAt     DateTime?
+  sessions      Session[]
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+  deletedAt     DateTime?
+
+  @@index([userId])
+  @@index([trustStatus])
+  @@index([createdAt])
+}
+
+/// Refresh token model - Implements token rotation (no plaintext token)
+model RefreshToken {
+  id            String    @id @default(cuid())
+  uuid          String    @unique @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash     String    @unique
+  tokenVersion  Int       @default(1) // Incremented on rotation
+  expiresAt     DateTime
+  rotatedAt     DateTime? // When this token was replaced by a new one
+  revokedAt     DateTime?
+  revokedReason String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  session       Session? // Optional reverse relation (one-to-one)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+}
+
+/// Password history for prevention of reuse (ADDED)
+model PasswordHistory {
+  id           String   @id @default(cuid())
+  uuid         String   @unique @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  passwordHash String
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+/// Password reset token model (no plaintext token)
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  uuid      String    @unique @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+/// Email verification token model (new)
+model EmailVerificationToken {
+  id        String    @id @default(cuid())
+  uuid      String    @unique @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+/// OTP request model (short-lived, plain code acceptable)
+model OTPRequest {
+  id          String    @id @default(cuid())
+  uuid        String    @unique @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  code        String
+  type        OTPType
+  status      OTPStatus @default(PENDING)
+  recipient   String // email or phone
+  expiresAt   DateTime
+  verifiedAt  DateTime?
+  usedAt      DateTime?
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(3)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([expiresAt])
+  @@index([type])
+}
+
+/// API Key model for programmatic access (keeps both plain key and hash)
+model APIKey {
+  id          String    @id @default(cuid())
+  uuid        String    @unique @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  key         String    @unique // plaintext key shown only once
+  keyHash     String    @unique
+  name        String
+  description String?
+  lastUsedAt  DateTime?
+  isActive    Boolean   @default(true)
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([isActive])
+}
+
+/// Country model
+model Country {
+  id          String     @id @default(cuid())
+  uuid        String     @unique @default(cuid())
+  code        String     @unique // ISO 3166-1 alpha-2
+  name        String     @unique
+  displayName String?
+  isActive    Boolean    @default(true)
+  currencies  Currency[]
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  @@index([code])
+  @@index([isActive])
+}
+
+/// Currency model
+model Currency {
+  id            String       @id @default(cuid())
+  uuid          String       @unique @default(cuid())
+  code          CurrencyCode @unique
+  name          String       @unique
+  symbol        String
+  decimalPlaces Int          @default(2)
+  countryId     String?
+  country       Country?     @relation(fields: [countryId], references: [id], onDelete: SetNull)
+  isActive      Boolean      @default(true)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  @@index([code])
+  @@index([isActive])
+}
+
+/// Exchange rate model
+model ExchangeRate {
+  id             String   @id @default(cuid())
+  uuid           String   @unique @default(cuid())
+  baseCurrency   String
+  targetCurrency String
+  rate           Decimal  @db.Decimal(18, 8)
+  timestamp      DateTime @default(now())
+  source         String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([baseCurrency, targetCurrency, createdAt])
+  @@index([baseCurrency])
+  @@index([targetCurrency])
+  @@index([createdAt])
+}
+
+/// Document model - KYC documents
+model Document {
+  id             String         @id @default(cuid())
+  uuid           String         @unique @default(cuid())
+  type           DocumentType
+  documentUrl    String
+  documentNumber String?
+  issuedDate     DateTime?
+  expiryDate     DateTime?
+  status         DocumentStatus @default(PENDING)
+  verifiedAt     DateTime?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  deletedAt      DateTime?
+  createdBy      String?
+  @@index([status])
+  @@index([type])
+}
+
+
+// ============================================================================
+// NOTIFICATIONS (unchanged)
+// ============================================================================
+
+/// Notification model
+model Notification {
+  id            String             @id @default(cuid())
+  uuid          String             @unique @default(cuid())
+  type          NotificationType
+  status        NotificationStatus @default(PENDING)
+  subject       String
+  message       String
+  channel       String // "email", "sms", "push", "in-app"
+  recipient     String
+  sentAt        DateTime?
+  deliveredAt   DateTime?
+  readAt        DateTime?
+  failureReason String?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  @@index([status])
+  @@index([type])
+  @@index([createdAt])
+}
+
+// ============================================================================
+// AUDIT & SECURITY (unchanged)
+// ============================================================================
+
+/// Audit log model
+model AuditLog {
+  id            String      @id @default(cuid())
+  uuid          String      @unique @default(cuid())
+  action        AuditAction
+  module        String
+  resource      String // e.g., "User", "Transaction", "Account"
+  resourceId    String
+  userId        String
+  user          User        @relation("AuditCreator", fields: [userId], references: [id], onDelete: Restrict)
+  updatedBy     String?
+  updatedByUser User?       @relation("AuditUpdater", fields: [updatedBy], references: [id], onDelete: SetNull)
+  oldValue      String?     @db.Text
+  newValue      String?     @db.Text
+  device        String?
+  ipAddress     String?
+  userAgent     String?
+  status        String?
+  reason        String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([userId])
+  @@index([action])
+  @@index([module])
+  @@index([resourceId])
+  @@index([createdAt])
+}
+
+/// Security event model
+model SecurityEvent {
+  id          String            @id @default(cuid())
+  uuid        String            @unique @default(cuid())
+  userId      String
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  eventType   SecurityEventType
+  description String?
+  ipAddress   String?
+  userAgent   String?
+  deviceId    String?
+  location    String?
+  severity    String            @default("LOW") // LOW, MEDIUM, HIGH, CRITICAL
+  isResolved  Boolean           @default(false)
+  resolvedAt  DateTime?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@index([userId])
+  @@index([eventType])
+  @@index([severity])
+  @@index([createdAt])
+}
+
+// ============================================================================
+// SYSTEM CONFIGURATION (unchanged)
+// ============================================================================
+
+/// Feature flag model
+model FeatureFlag {
+  id                String   @id @default(cuid())
+  uuid              String   @unique @default(cuid())
+  key               String   @unique
+  name              String
+  description       String?
+  isEnabled         Boolean  @default(false)
+  rolloutPercentage Int      @default(0) // 0-100
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([isEnabled])
+}
+
+/// System setting model
+model SystemSetting {
+  id          String   @id @default(cuid())
+  uuid        String   @unique @default(cuid())
+  key         String   @unique
+  value       String   @db.Text
+  description String?
+  dataType    String   @default("string") // string, number, boolean, json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([key])
+}

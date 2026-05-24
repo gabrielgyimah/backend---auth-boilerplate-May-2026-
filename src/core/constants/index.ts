@@ -1,0 +1,233 @@
+/**
+ * Core application constants
+ */
+
+// ============================================================================
+// USER ROLES
+// ============================================================================
+export const ROLES = {
+  SUPER_ADMIN: 'SUPER_ADMIN',
+  SYSTEM_ADMIN: 'SYSTEM_ADMIN',
+  COMPLIANCE_OFFICER: 'COMPLIANCE_OFFICER',
+  BRANCH_MANAGER: 'BRANCH_MANAGER',
+  CUSTOMER_SERVICE: 'CUSTOMER_SERVICE',
+  AUDITOR: 'AUDITOR',
+  TELLER: 'TELLER',
+  OPERATIONS_MANAGER: 'OPERATIONS_MANAGER',
+  LOAN_OFFICER: 'LOAN_OFFICER',
+  SUPPORT_AGENT: 'SUPPORT_AGENT',
+  DEVELOPER: 'DEVELOPER',
+  CUSTOMER: 'CUSTOMER',
+  EMPLOYEE: 'EMPLOYEE',
+} as const;
+
+export type RoleTypeVal = typeof ROLES[keyof typeof ROLES];
+
+export const PERMISSION_CODES = {
+  USERS_CREATE: 'users:create',
+  USERS_READ: 'users:read',
+  USERS_UPDATE: 'users:update',
+  USERS_DELETE: 'users:delete',
+  USERS_MANAGE_ROLES: 'users:manage_roles',
+  USERS_MANAGE_PERMISSIONS: 'users:manage_permissions',
+
+
+  AUDIT_READ: 'audit:read',
+  AUDIT_EXPORT: 'audit:export',
+  SECURITY_EVENTS_READ: 'security_events:read',
+  SECURITY_EVENTS_MANAGE: 'security_events:manage',
+
+  ROLES_CREATE: 'roles:create',
+  ROLES_READ: 'roles:read',
+  ROLES_UPDATE: 'roles:update',
+  ROLES_DELETE: 'roles:delete',
+  PERMISSIONS_READ: 'permissions:read',
+  PERMISSIONS_MANAGE: 'permissions:manage',
+
+  SETTINGS_READ: 'settings:read',
+  SETTINGS_UPDATE: 'settings:update',
+
+  FEATURE_FLAGS_MANAGE: 'feature_flags:manage',
+} as const;
+
+export const PASSWORD_POLICY = {
+  MIN_LENGTH: 12,
+  MAX_LENGTH: 128,
+  REQUIRE_UPPERCASE: true,
+  REQUIRE_LOWERCASE: true,
+  REQUIRE_NUMBERS: true,
+  REQUIRE_SPECIAL_CHARS: true,
+  SPECIAL_CHARS: "!@#$%^&*()_+[]{}|;:,.<>?/~", // Add this line
+  HISTORY_COUNT: 5,
+  EXPIRY_DAYS: 90,
+};
+
+export const SECURITY = {
+  MAX_LOGIN_ATTEMPTS: 5,
+  LOCKOUT_DURATION_MINUTES: 30,
+  MFA_OTP_EXPIRY_MINUTES: 5,
+  CHALLENGE_TOKEN_EXPIRY_MINUTES: 5,
+  EMAIL_TOKEN_EXPIRY_HOURS: 24,
+  PASSWORD_RESET_EXPIRY_HOURS: 1,
+};
+
+export const TOKEN_EXPIRY = {
+  ACCESS_TOKEN: '15m',
+  REFRESH_TOKEN: '7d',
+};
+
+// ============================================================================
+// OTP TYPES
+// ============================================================================
+export const OTP_TYPE = {
+  EMAIL_VERIFICATION: 'EMAIL_VERIFICATION',
+  PHONE_VERIFICATION: 'PHONE_VERIFICATION',
+  PASSWORD_RESET: 'PASSWORD_RESET',
+  TWO_FACTOR: 'TWO_FACTOR',
+  LOGIN_VERIFICATION: 'LOGIN_VERIFICATION',
+} as const;
+
+// ============================================================================
+// AUDIT ACTIONS
+// ============================================================================
+export const AUDIT_ACTION = {
+  CREATE: 'CREATE',
+  READ: 'READ',
+  UPDATE: 'UPDATE',
+  DELETE: 'DELETE',
+  APPROVE: 'APPROVE',
+  REJECT: 'REJECT',
+  SUBMIT: 'SUBMIT',
+  CANCEL: 'CANCEL',
+  EXPORT: 'EXPORT',
+  IMPORT: 'IMPORT',
+} as const;
+
+// ============================================================================
+// SECURITY EVENT TYPES
+// ============================================================================
+export const SECURITY_EVENT_TYPE = {
+  LOGIN_SUCCESS: 'LOGIN_SUCCESS',
+  LOGIN_FAILURE: 'LOGIN_FAILURE',
+  LOGOUT: 'LOGOUT',
+  PASSWORD_CHANGE: 'PASSWORD_CHANGE',
+  PASSWORD_RESET: 'PASSWORD_RESET',
+  MFA_ENABLED: 'MFA_ENABLED',
+  MFA_DISABLED: 'MFA_DISABLED',
+  TOKEN_REFRESH: 'TOKEN_REFRESH',
+  SUSPICIOUS_ACTIVITY: 'SUSPICIOUS_ACTIVITY',
+  ACCOUNT_LOCKED: 'ACCOUNT_LOCKED',
+  PERMISSION_DENIED: 'PERMISSION_DENIED',
+  DATA_ACCESS: 'DATA_ACCESS',
+  RESOURCE_CREATED: 'RESOURCE_CREATED',
+  RESOURCE_UPDATED: 'RESOURCE_UPDATED',
+  RESOURCE_DELETED: 'RESOURCE_DELETED',
+} as const;
+
+// ============================================================================
+// NOTIFICATION TYPES
+// ============================================================================
+export const NOTIFICATION_TYPE = {
+  TRANSACTION_ALERT: 'TRANSACTION_ALERT',
+  SECURITY_ALERT: 'SECURITY_ALERT',
+  ACCOUNT_UPDATE: 'ACCOUNT_UPDATE',
+  SYSTEM_NOTIFICATION: 'SYSTEM_NOTIFICATION',
+  PROMOTIONAL: 'PROMOTIONAL',
+  OTP: 'OTP',
+  VERIFICATION: 'VERIFICATION',
+  ERROR_NOTIFICATION: 'ERROR_NOTIFICATION',
+} as const;
+
+// ============================================================================
+// HTTP STATUS CODES
+// ============================================================================
+export const HTTP_STATUS = {
+  OK: 200,
+  CREATED: 201,
+  ACCEPTED: 202,
+  BAD_REQUEST: 400,
+  UNAUTHORIZED: 401,
+  FORBIDDEN: 403,
+  NOT_FOUND: 404,
+  CONFLICT: 409,
+  UNPROCESSABLE_ENTITY: 422,
+  TOO_MANY_REQUESTS: 429,
+  INTERNAL_SERVER_ERROR: 500,
+  SERVICE_UNAVAILABLE: 503,
+} as const;
+
+// ============================================================================
+// TIME CONSTANTS (in milliseconds)
+// ============================================================================
+export const TIME = {
+  MINUTE: 60 * 1000,
+  HOUR: 60 * 60 * 1000,
+  DAY: 24 * 60 * 60 * 1000,
+  WEEK: 7 * 24 * 60 * 60 * 1000,
+  MONTH: 30 * 24 * 60 * 60 * 1000,
+  YEAR: 365 * 24 * 60 * 60 * 1000,
+} as const;
+
+// ============================================================================
+// PAGINATION DEFAULTS
+// ============================================================================
+export const PAGINATION = {
+  DEFAULT_PAGE: 1,
+  DEFAULT_LIMIT: 20,
+  MAX_LIMIT: 100,
+} as const;
+
+// ============================================================================
+// RATE LIMITING
+// ============================================================================
+export const RATE_LIMIT = {
+  WINDOW_MS: 15 * 60 * 1000, // 15 minutes
+  MAX_REQUESTS: 100,
+  LOGIN_WINDOW_MS: 15 * 60 * 1000,
+  LOGIN_MAX_REQUESTS: 5,
+} as const;
+
+// ============================================================================
+// MODULES
+// ============================================================================
+export const MODULES = {
+  AUTH: 'auth',
+  USERS: 'users',
+  ROLES: 'roles',
+  PERMISSIONS: 'permissions',
+  AUDIT: 'audit',
+  NOTIFICATIONS: 'notifications',
+  SETTINGS: 'settings',
+} as const;
+
+// ============================================================================
+// SYSTEM ADMIN ROLE PERMISSIONS (seed data)
+// ============================================================================
+export const SYSTEM_ADMIN_PERMISSIONS = [
+  // User Management - Full access
+  PERMISSION_CODES.USERS_CREATE,
+  PERMISSION_CODES.USERS_READ,
+  PERMISSION_CODES.USERS_UPDATE,
+  PERMISSION_CODES.USERS_DELETE,
+  PERMISSION_CODES.USERS_MANAGE_ROLES,
+  PERMISSION_CODES.USERS_MANAGE_PERMISSIONS,
+
+  // Audit & Security - Full access
+  PERMISSION_CODES.AUDIT_READ,
+  PERMISSION_CODES.AUDIT_EXPORT,
+  PERMISSION_CODES.SECURITY_EVENTS_READ,
+  PERMISSION_CODES.SECURITY_EVENTS_MANAGE,
+
+  // Role & Permission Management - Full access
+  PERMISSION_CODES.ROLES_CREATE,
+  PERMISSION_CODES.ROLES_READ,
+  PERMISSION_CODES.ROLES_UPDATE,
+  PERMISSION_CODES.ROLES_DELETE,
+  PERMISSION_CODES.PERMISSIONS_READ,
+  PERMISSION_CODES.PERMISSIONS_MANAGE,
+
+  // System Settings - Full access
+  PERMISSION_CODES.SETTINGS_READ,
+  PERMISSION_CODES.SETTINGS_UPDATE,
+  PERMISSION_CODES.FEATURE_FLAGS_MANAGE,
+];
