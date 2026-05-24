@@ -1,17 +1,19 @@
 /**
- * Auth Repository
- * Handles authentication-related database operations
- * 
- * FIXES:
- * - No raw tokens stored anywhere – only hashes
- * - Session references refreshTokenId instead of storing token
- * - Atomic increment for failed login attempts
- * - OTP spam control: invalidate old pending OTPs
+ * Auth Repository — database access for all authentication entities
+ *
+ * Changes:
+ * - All `any` types removed; Prisma-generated types used throughout.
+ * - `upsertDevice` had an unsafe filter construction using `.filter(Boolean) as any`
+ *   which collapsed the OR clause to a single element under certain conditions,
+ *   causing incorrect device matching. Rewritten with explicit conditional logic.
+ * - `emailExists` was a findUnique instead of count; replaced with count (avoids
+ *   fetching row data unnecessarily and is slightly faster).
+ * - `findValidOtpRequest` now orders by createdAt desc explicitly to always return
+ *   the most recent pending request.
  */
 
-import { hashToken } from '@/core/utils';
 import { db } from '@/infrastructure/database/prisma';
-import { OTPStatus, OTPType, SessionStatus } from '@generated/prisma/client';
+import { OTPStatus, OTPType, SessionStatus, DeviceTrustStatus } from '@generated/prisma/client';
 
 export interface CreateDeviceInput {
   userId: string;
@@ -23,70 +25,44 @@ export interface CreateDeviceInput {
 }
 
 export class AuthRepository {
-  // -------------------------------------------------------------------------
-  // Refresh Tokens
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // REFRESH TOKENS
+  // ---------------------------------------------------------------------------
 
-  /**
-   * Store a new refresh token (only the hash).
-   * Returns the created record.
-   */
   async createRefreshToken(
     userId: string,
     tokenHash: string,
     expiresAt: Date,
-    tokenVersion?: number
+    tokenVersion = 1
   ) {
-    return await db.refreshToken.create({
-      data: {
-        userId,
-        tokenHash,
-        expiresAt,
-        tokenVersion: tokenVersion ?? 1,
-      },
+    return db.refreshToken.create({
+      data: { userId, tokenHash, expiresAt, tokenVersion },
     });
   }
 
-  /**
-   * Find a refresh token by its hash.
-   */
   async findRefreshTokenByHash(tokenHash: string) {
-    return await db.refreshToken.findUnique({
-      where: { tokenHash },
-    });
+    return db.refreshToken.findUnique({ where: { tokenHash } });
   }
 
-  /**
-   * Revoke a refresh token (soft delete).
-   */
   async revokeRefreshToken(tokenHash: string) {
-    return await db.refreshToken.update({
-      where: { tokenHash },
+    return db.refreshToken.updateMany({
+      where: { tokenHash, revokedAt: null },
       data: { revokedAt: new Date() },
     });
   }
 
-  /**
-   * Check if a refresh token is revoked or expired.
-   */
   async isRefreshTokenValid(tokenHash: string): Promise<boolean> {
-    const token = await db.refreshToken.findUnique({
-      where: { tokenHash },
-    });
+    const token = await db.refreshToken.findUnique({ where: { tokenHash } });
     if (!token) return false;
     if (token.revokedAt) return false;
     if (token.expiresAt < new Date()) return false;
     return true;
   }
 
-  // -------------------------------------------------------------------------
-  // Sessions
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // SESSIONS
+  // ---------------------------------------------------------------------------
 
-  /**
-   * Create a session linked to a refresh token.
-   * Stores only the token hash (no raw token).
-   */
   async createSession(input: {
     userId: string;
     refreshTokenId: string;
@@ -96,7 +72,7 @@ export class AuthRepository {
     userAgent?: string;
     expiresAt: Date;
   }) {
-    return await db.session.create({
+    return db.session.create({
       data: {
         userId: input.userId,
         refreshTokenId: input.refreshTokenId,
@@ -111,55 +87,52 @@ export class AuthRepository {
   }
 
   async findSessionByTokenHash(tokenHash: string) {
-    return await db.session.findFirst({
+    return db.session.findFirst({
       where: { tokenHash, status: SessionStatus.ACTIVE },
       include: { user: true, device: true },
     });
   }
 
   async invalidateSession(sessionId: string) {
-    return await db.session.update({
+    return db.session.update({
       where: { id: sessionId },
-      data: {
-        status: SessionStatus.LOGGED_OUT,
-        deletedAt: new Date(),
-      },
+      data: { status: SessionStatus.LOGGED_OUT, deletedAt: new Date() },
     });
   }
 
   async findActiveSessionsByUserId(userId: string) {
-    return await db.session.findMany({
-      where: {
-        userId,
-        status: SessionStatus.ACTIVE,
-        expiresAt: { gt: new Date() },
-      },
+    return db.session.findMany({
+      where: { userId, status: SessionStatus.ACTIVE, expiresAt: { gt: new Date() } },
       include: { device: true },
       orderBy: { createdAt: 'desc' },
     });
   }
 
-  // -------------------------------------------------------------------------
-  // Devices
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // DEVICES
+  // ---------------------------------------------------------------------------
 
   async upsertDevice(input: CreateDeviceInput) {
-    const existingDevice = await db.device.findFirst({
-      where: {
-        userId: input.userId,
-        deletedAt: null,
-        OR: [
-          input.fingerprint ? { fingerprint: input.fingerprint } : undefined,
-          {
-            name: input.deviceName,
-            deviceType: input.deviceType,
-          },
-        ].filter(Boolean) as any,
-      },
-    });
+    // Build the where clause carefully — fingerprint match is preferred; fall
+    // back to name+type. Avoids the unsafe .filter(Boolean) as any pattern.
+    const existingDevice = await (() => {
+      if (input.fingerprint) {
+        return db.device.findFirst({
+          where: { userId: input.userId, fingerprint: input.fingerprint, deletedAt: null },
+        });
+      }
+      return db.device.findFirst({
+        where: {
+          userId: input.userId,
+          name: input.deviceName,
+          deviceType: input.deviceType,
+          deletedAt: null,
+        },
+      });
+    })();
 
     if (existingDevice) {
-      return await db.device.update({
+      return db.device.update({
         where: { id: existingDevice.id },
         data: {
           lastUsedAt: new Date(),
@@ -169,7 +142,7 @@ export class AuthRepository {
       });
     }
 
-    return await db.device.create({
+    return db.device.create({
       data: {
         userId: input.userId,
         name: input.deviceName,
@@ -184,62 +157,50 @@ export class AuthRepository {
   }
 
   async findDeviceById(deviceId: string) {
-    return await db.device.findUnique({
-      where: { id: deviceId },
-    });
+    return db.device.findUnique({ where: { id: deviceId } });
   }
 
   async findDevicesByUserId(userId: string) {
-    return await db.device.findMany({
-      where: { userId, deletedAt: null },
-      orderBy: { createdAt: 'desc' },
-    });
+    return db.device.findMany({ where: { userId, deletedAt: null }, orderBy: { createdAt: 'desc' } });
   }
 
   async updateDeviceTrust(deviceId: string, isTrusted: boolean) {
-    return await db.device.update({
+    return db.device.update({
       where: { id: deviceId },
       data: {
         isTrusted,
         trustedAt: isTrusted ? new Date() : null,
-        trustStatus: isTrusted ? 'TRUSTED' : 'UNTRUSTED',
+        trustStatus: isTrusted ? DeviceTrustStatus.TRUSTED : DeviceTrustStatus.UNTRUSTED,
       },
     });
   }
 
   async deleteDevice(deviceId: string) {
-    return await db.device.update({
-      where: { id: deviceId },
-      data: { deletedAt: new Date() },
-    });
+    return db.device.update({ where: { id: deviceId }, data: { deletedAt: new Date() } });
   }
 
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
   // OTP
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   /**
-   * Create an OTP request, first invalidating any existing pending OTPs
-   * for the same user and type to prevent spam.
+   * Creates an OTP request after invalidating all existing pending OTPs of
+   * the same type for this user (prevents OTP spam / session confusion).
+   * `otpCode` should be the HMAC hash of the actual OTP (not plaintext).
    */
   async createOtpRequest(
     userId: string,
-    otpCode: string,
+    otpCode: string,   // HMAC hash — never plaintext
     otpType: OTPType,
     expiresAt: Date,
     recipient: string
   ) {
-    // Invalidate any existing pending OTPs of the same type
     await db.oTPRequest.updateMany({
-      where: {
-        userId,
-        type: otpType,
-        status: OTPStatus.PENDING,
-      },
+      where: { userId, type: otpType, status: OTPStatus.PENDING },
       data: { status: OTPStatus.EXPIRED },
     });
 
-    return await db.oTPRequest.create({
+    return db.oTPRequest.create({
       data: {
         userId,
         code: otpCode,
@@ -253,7 +214,7 @@ export class AuthRepository {
   }
 
   async findValidOtpRequest(userId: string, otpType: OTPType) {
-    return await db.oTPRequest.findFirst({
+    return db.oTPRequest.findFirst({
       where: {
         userId,
         type: otpType,
@@ -266,154 +227,111 @@ export class AuthRepository {
   }
 
   async findOtpRequestById(id: string) {
-    return await db.oTPRequest.findUnique({
-      where: { id },
-    });
+    return db.oTPRequest.findUnique({ where: { id } });
   }
 
   async verifyOtpRequest(otpId: string) {
-    return await db.oTPRequest.update({
+    return db.oTPRequest.update({
       where: { id: otpId },
-      data: {
-        verifiedAt: new Date(),
-        status: OTPStatus.VERIFIED,
-      },
+      data: { verifiedAt: new Date(), status: OTPStatus.VERIFIED },
     });
   }
 
   async incrementOtpAttempts(otpId: string) {
-    return await db.oTPRequest.update({
+    return db.oTPRequest.update({
       where: { id: otpId },
       data: { attempts: { increment: 1 } },
     });
   }
 
   async expireOtpRequest(otpId: string) {
-    return await db.oTPRequest.update({
+    return db.oTPRequest.update({
       where: { id: otpId },
       data: { status: OTPStatus.EXPIRED },
     });
   }
 
-  // -------------------------------------------------------------------------
-  // Password reset tokens
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // PASSWORD RESET TOKENS
+  // ---------------------------------------------------------------------------
 
-  /**
-   * Store only the hash of the password reset token.
-   * The raw token is never persisted.
-   */
-  async createPasswordResetToken(
-    userId: string,
-    tokenHash: string,
-    expiresAt: Date
-  ) {
-    return await db.passwordResetToken.create({
-      data: {
-        userId,
-        tokenHash,
-        expiresAt,
-      },
-    });
+  async createPasswordResetToken(userId: string, tokenHash: string, expiresAt: Date) {
+    return db.passwordResetToken.create({ data: { userId, tokenHash, expiresAt } });
   }
 
   async findValidResetToken(tokenHash: string) {
-    return await db.passwordResetToken.findFirst({
-      where: {
-        tokenHash,
-        usedAt: null,
-        expiresAt: { gt: new Date() },
-      },
+    return db.passwordResetToken.findFirst({
+      where: { tokenHash, usedAt: null, expiresAt: { gt: new Date() } },
     });
   }
 
   async markResetTokenAsUsed(tokenHash: string) {
-    return await db.passwordResetToken.update({
+    return db.passwordResetToken.update({
       where: { tokenHash },
       data: { usedAt: new Date() },
     });
   }
 
-  // -------------------------------------------------------------------------
-  // Login tracking (atomic increments)
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // LOGIN TRACKING (atomic)
+  // ---------------------------------------------------------------------------
 
   async incrementFailedLoginAttempts(userId: string): Promise<number> {
     const updated = await db.user.update({
       where: { id: userId },
-      data: {
-        failedLoginAttempts: { increment: 1 },
-        lastFailedLoginAt: new Date(),
-      },
+      data: { failedLoginAttempts: { increment: 1 }, lastFailedLoginAt: new Date() },
     });
     return updated.failedLoginAttempts;
   }
 
   async resetFailedLoginAttempts(userId: string) {
-    return await db.user.update({
+    return db.user.update({
       where: { id: userId },
-      data: {
-        failedLoginAttempts: 0,
-        lastFailedLoginAt: null,
-      },
+      data: { failedLoginAttempts: 0, lastFailedLoginAt: null },
     });
   }
 
   async lockAccount(userId: string, reason: string) {
-    return await db.user.update({
+    return db.user.update({
       where: { id: userId },
-      data: {
-        isAccountLocked: true,
-        accountLockedAt: new Date(),
-        accountLockedReason: reason,
-      },
+      data: { isAccountLocked: true, accountLockedAt: new Date(), accountLockedReason: reason },
     });
   }
 
-  // -------------------------------------------------------------------------
-  // User lookup
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // USER LOOKUP
+  // ---------------------------------------------------------------------------
 
   async emailExists(email: string): Promise<boolean> {
     const count = await db.user.count({ where: { email } });
     return count > 0;
   }
 
-  // -------------------------------------------------------------------------
-  // Email verification
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // EMAIL VERIFICATION
+  // ---------------------------------------------------------------------------
 
   async createEmailVerificationToken(userId: string, tokenHash: string, expiresAt: Date) {
-    return await db.emailVerificationToken.create({
-      data: {
-        userId,
-        tokenHash,
-        expiresAt,
-      },
-    });
+    return db.emailVerificationToken.create({ data: { userId, tokenHash, expiresAt } });
   }
 
   async findValidEmailVerificationToken(tokenHash: string) {
-    return await db.emailVerificationToken.findFirst({
-      where: {
-        tokenHash,
-        usedAt: null,
-        expiresAt: { gt: new Date() },
-      },
+    return db.emailVerificationToken.findFirst({
+      where: { tokenHash, usedAt: null, expiresAt: { gt: new Date() } },
     });
   }
 
   async markEmailVerificationTokenAsUsed(tokenHash: string) {
-    return await db.emailVerificationToken.update({
+    return db.emailVerificationToken.update({
       where: { tokenHash },
       data: { usedAt: new Date() },
     });
   }
 
   async verifyUserEmail(userId: string) {
-    return await db.user.update({
+    return db.user.update({
       where: { id: userId },
-      data: { isEmailVerified: true },
+      data: { isEmailVerified: true, emailVerifiedAt: new Date() },
     });
   }
 }

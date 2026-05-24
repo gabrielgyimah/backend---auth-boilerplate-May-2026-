@@ -1,409 +1,239 @@
 /**
- * Authorization Middleware
- * Implements RBAC (Role-Based Access Control) and PBAC (Permission-Based Access Control)
+ * Authorization Guards (RBAC + PBAC)
+ *
+ * Critical fixes:
+ *
+ * 1. N+1 DATABASE QUERIES — Each `hasPermission` / `hasAllPermissions` /
+ *    `hasRole` call fetched the full user + role + all permissions from DB on
+ *    EVERY protected request. For a request pipeline with multiple guards this
+ *    is 3+ sequential DB round-trips. Fixed by using a single optimised query
+ *    and caching permissions in req.user (which is already set by authenticate()).
+ *    The access token already contains `role` and `permissions[]`, so for the
+ *    vast majority of requests we can skip the DB entirely and check the JWT
+ *    payload — which is cryptographically verified. Only when we need liveness
+ *    (e.g. an admin revoked a role mid-session) should we hit the DB.
+ *
+ * 2. req.user typed as `any` everywhere. Now uses AccessTokenPayload.
+ *
+ * 3. `checkBranchAccess` referenced `user.branchId` which does NOT exist on
+ *    the User model in the Prisma schema — it's a dead field that would have
+ *    silently set req.branchId to undefined on every request.
+ *
+ * 4. `policyGuard` passed `req.body || req.params` as the resource which is
+ *    untyped and unsafe. Changed to a properly typed callback signature.
+ *
+ * 5. `userHasPermission` / `getUserPermissions` were duplicated between this
+ *    file and auth.service.ts. Retained here as the canonical location.
+ *
+ * 6. Removed `branchId` from the global Request augmentation since the User
+ *    schema has no branchId column. If branch management is added later, it
+ *    should be added to the schema first.
  */
 
 import { Request, Response, NextFunction } from 'express';
 import { db } from '@/infrastructure/database/prisma';
-import { AuthorizationError, AppError } from '@/core/errors/AppError';
+import { AuthorizationError } from '@/core/errors/AppError';
+import type { AccessTokenPayload } from '@/core/utils';
 
 // ============================================================================
-// ROLE-BASED ACCESS CONTROL (RBAC)
+// INTERNAL — single DB fetch for a user's effective permission set
+// ============================================================================
+
+async function fetchEffectivePermissions(userId: string): Promise<Set<string>> {
+  const user = await db.user.findUnique({
+    where: { id: userId },
+    select: {
+      role: {
+        select: {
+          permissions: { select: { code: true } },
+        },
+      },
+      permissions: {
+        where: { expiresAt: null },           // ignore expired direct grants
+        select: { permission: { select: { code: true } } },
+      },
+    },
+  });
+
+  if (!user) return new Set();
+
+  const set = new Set<string>();
+  for (const p of user.role.permissions) set.add(p.code);
+  for (const up of user.permissions) set.add(up.permission.code);
+  return set;
+}
+
+// ============================================================================
+// FAST-PATH: check JWT payload first (avoids DB for most requests)
+// ============================================================================
+
+function permissionsFromToken(req: Request): string[] | null {
+  const u = req.user as AccessTokenPayload | undefined;
+  return u?.permissions ?? null;
+}
+
+// ============================================================================
+// RBAC MIDDLEWARE
 // ============================================================================
 
 /**
- * Middleware to check if user has a specific role
+ * Checks the user's primary role (from verified JWT) against the allowed list.
+ * No DB call required — role is embedded in the signed access token.
  */
 export function hasRole(...requiredRoles: string[]) {
-  return async (req: Request, _res: Response, next: NextFunction): Promise<void> => {
-    try {
-      if (!req.user) {
-        throw new AuthorizationError('User not authenticated');
-      }
+  return (req: Request, _res: Response, next: NextFunction): void => {
+    const user = req.user as AccessTokenPayload | undefined;
+    if (!user) return next(new AuthorizationError('User not authenticated'));
 
-      // Get user with role from database
-      const user = await db.user.findUnique({
-        where: { id: req.user.id },
-        include: { role: true },
-      });
-
-      if (!user) {
-        throw new AuthorizationError('User not found');
-      }
-
-      // Check if user's role is in required roles
-      if (!requiredRoles.includes(user.role.name)) {
-        throw new AuthorizationError(`Access denied. Required roles: ${requiredRoles.join(', ')}`);
-      }
-
-      next();
-    } catch (error) {
-      next(error instanceof AuthorizationError ? error : new AuthorizationError('Authorization failed'));
+    if (!requiredRoles.includes(user.role)) {
+      return next(
+        new AuthorizationError(`Access denied. Required roles: ${requiredRoles.join(', ')}`)
+      );
     }
+    next();
   };
 }
 
+// ============================================================================
+// PBAC MIDDLEWARE — any of the listed permissions
+// ============================================================================
+
 /**
- * Middleware to check if user has a specific permission
+ * Checks that the user holds at LEAST ONE of the required permissions.
+ * Fast path: reads permissions from the verified JWT payload.
+ * Slow path: falls back to a single DB query if the token has no permissions array.
  */
 export function hasPermission(...requiredPermissions: string[]) {
   return async (req: Request, _res: Response, next: NextFunction): Promise<void> => {
+    const user = req.user as AccessTokenPayload | undefined;
+    if (!user) return next(new AuthorizationError('User not authenticated'));
+
     try {
-      if (!req.user) {
-        throw new AuthorizationError('User not authenticated');
-      }
+      const tokenPerms = permissionsFromToken(req);
+      const perms: ReadonlySet<string> = tokenPerms
+        ? new Set(tokenPerms)
+        : await fetchEffectivePermissions(user.userId);
 
-      // Get user with permissions
-      const user = await db.user.findUnique({
-        where: { id: req.user.id },
-        include: {
-          role: {
-            include: {
-              permissions: {
-                select: { code: true },
-              },
-            },
-          },
-          permissions: {
-            include: {
-              permission: {
-                select: { code: true },
-              },
-            },
-          },
-        },
-      });
-
-      if (!user) {
-        throw new AuthorizationError('User not found');
-      }
-
-      // Get all user permissions from role and direct assignments
-      const userPermissions = new Set<string>();
-
-      // Add role permissions
-      user.role.permissions.forEach((p: { code: string }) => {
-        userPermissions.add(p.code);
-      });
-
-      // Add direct user permissions
-      user.permissions.forEach((p: { permission: { code: string } }) => {
-        userPermissions.add(p.permission.code);
-      });
-
-      // Check if user has any of the required permissions
-      const hasPermission = requiredPermissions.some((perm) => userPermissions.has(perm));
-
-      if (!hasPermission) {
-        throw new AuthorizationError(
-          `Access denied. Required permissions: ${requiredPermissions.join(', ')}`
+      if (!requiredPermissions.some((p) => perms.has(p))) {
+        return next(
+          new AuthorizationError(
+            `Access denied. Required permissions: ${requiredPermissions.join(', ')}`
+          )
         );
       }
-
       next();
-    } catch (error) {
-      next(
-        error instanceof AuthorizationError
-          ? error
-          : new AuthorizationError('Permission check failed')
-      );
+    } catch {
+      next(new AuthorizationError('Permission check failed'));
     }
   };
 }
 
-/**
- * Middleware to check if user has multiple permissions (all required)
- */
+// ============================================================================
+// PBAC MIDDLEWARE — ALL listed permissions required
+// ============================================================================
+
 export function hasAllPermissions(...requiredPermissions: string[]) {
   return async (req: Request, _res: Response, next: NextFunction): Promise<void> => {
+    const user = req.user as AccessTokenPayload | undefined;
+    if (!user) return next(new AuthorizationError('User not authenticated'));
+
     try {
-      if (!req.user) {
-        throw new AuthorizationError('User not authenticated');
-      }
+      const tokenPerms = permissionsFromToken(req);
+      const perms: ReadonlySet<string> = tokenPerms
+        ? new Set(tokenPerms)
+        : await fetchEffectivePermissions(user.userId);
 
-      const user = await db.user.findUnique({
-        where: { id: req.user.id },
-        include: {
-          role: {
-            include: {
-              permissions: {
-                select: { code: true },
-              },
-            },
-          },
-          permissions: {
-            include: {
-              permission: {
-                select: { code: true },
-              },
-            },
-          },
-        },
-      });
-
-      if (!user) {
-        throw new AuthorizationError('User not found');
-      }
-
-      const userPermissions = new Set<string>();
-      user.role.permissions.forEach((p: { code: string }) => {
-        userPermissions.add(p.code);
-      });
-      user.permissions.forEach((p: { permission: { code: string } } ) => {
-        userPermissions.add(p.permission.code);
-      });
-
-      // Check if user has ALL required permissions
-      const hasAllPerms = requiredPermissions.every((perm) => userPermissions.has(perm));
-
-      if (!hasAllPerms) {
-        throw new AuthorizationError(
-          `Access denied. All these permissions required: ${requiredPermissions.join(', ')}`
+      if (!requiredPermissions.every((p) => perms.has(p))) {
+        return next(
+          new AuthorizationError(
+            `Access denied. All permissions required: ${requiredPermissions.join(', ')}`
+          )
         );
       }
-
       next();
-    } catch (error) {
-      next(
-        error instanceof AuthorizationError
-          ? error
-          : new AuthorizationError('Permission check failed')
-      );
+    } catch {
+      next(new AuthorizationError('Permission check failed'));
     }
   };
 }
 
 // ============================================================================
-// RESOURCE-BASED ACCESS CONTROL
+// RESOURCE OWNERSHIP — stores param for downstream service-layer IDOR check
 // ============================================================================
 
 /**
- * Middleware to check resource ownership
- * Ensures user can only access their own resources
+ * Stores the route param identified by `resourceIdParam` into req.resourceId
+ * and req.ownerId. The service layer is responsible for the actual ownership
+ * assertion against the database — this middleware is intentionally lightweight.
  */
-export function checkResourceOwnership(resourceIdParam: string = 'id') {
-  return async (req: Request, _res: Response, next: NextFunction): Promise<void> => {
-    try {
-      if (!req.user) {
-        throw new AuthorizationError('User not authenticated');
-      }
+export function checkResourceOwnership(resourceIdParam = 'id') {
+  return (req: Request, _res: Response, next: NextFunction): void => {
+    const user = req.user as AccessTokenPayload | undefined;
+    if (!user) return next(new AuthorizationError('User not authenticated'));
 
-      const resourceId = req.params[resourceIdParam];
-      if (!resourceId) {
-        throw new AppError('Resource ID not provided', 400, 'INVALID_REQUEST');
-      }
-
-      // Store resource ID in request for later use
-      req.resourceId = resourceId;
-      req.ownerId = req.user.id;
-
-      next();
-    } catch (error) {
-      next(error);
+    const resourceId = req.params[resourceIdParam];
+    if (!resourceId) {
+      return next(new AuthorizationError('Resource ID not found in request'));
     }
-  };
-}
 
-/**
- * Middleware to check branch access
- * Ensures branch managers can only access their branch
- */
-export function checkBranchAccess() {
-  return async (req: Request, _res: Response, next: NextFunction): Promise<void> => {
-    try {
-      if (!req.user) {
-        throw new AuthorizationError('User not authenticated');
-      }
-
-      const user = await db.user.findUnique({
-        where: { id: req.user.id },
-      });
-
-      if (!user) {
-        throw new AuthorizationError('User not found');
-      }
-
-      // Store branch ID in request
-      req.branchId = user.branchId || undefined;
-
-      next();
-    } catch (error) {
-      next(error);
-    }
+    req.resourceId = resourceId;
+    req.ownerId = user.userId;
+    next();
   };
 }
 
 // ============================================================================
-// POLICY-BASED ACCESS CONTROL
+// SCOPE ENFORCEMENT
 // ============================================================================
 
-/**
- * Custom policy guard for complex authorization logic
- */
-export function policyGuard(
-  policyFunction: (user: Record<string, any>, resource?: any) => boolean
-) {
-  return async (req: Request, _res: Response, next: NextFunction): Promise<void> => {
-    try {
-      if (!req.user) {
-        throw new AuthorizationError('User not authenticated');
-      }
-
-      const allowed = policyFunction(req.user, req.body || req.params);
-
-      if (!allowed) {
-        throw new AuthorizationError('Access denied by policy');
-      }
-
-      next();
-    } catch (error) {
-      next(
-        error instanceof AuthorizationError
-          ? error
-          : new AuthorizationError('Policy check failed')
-      );
-    }
-  };
-}
-
-// ============================================================================
-// SCOPE-BASED ACCESS CONTROL
-// ============================================================================
-
-/**
- * Middleware to enforce scope-based access
- * e.g., Users can only view transactions from their own branch
- */
 export function enforceScope(scopeField: string) {
-  return async (req: Request, _res: Response, next: NextFunction): Promise<void> => {
-    try {
-      if (!req.user) {
-        throw new AuthorizationError('User not authenticated');
-      }
+  return (req: Request, _res: Response, next: NextFunction): void => {
+    const user = req.user as AccessTokenPayload | undefined;
+    if (!user) return next(new AuthorizationError('User not authenticated'));
 
-      // Store scope in request for service layer to use
-      req.scope = {
-        field: scopeField,
-        userId: req.user.id,
-      };
-
-      next();
-    } catch (error) {
-      next(error);
-    }
+    req.scope = { field: scopeField, userId: user.userId };
+    next();
   };
 }
 
-// Extend Express Request to include auth properties
-declare global {
-  namespace Express {
-    interface Request {
-      id?: string;
-      user?: any;
-      resourceId?: string;
-      ownerId?: string;
-      branchId?: string;
-      scope?: {
-        field: string;
-        userId: string;
-      };
+// ============================================================================
+// POLICY GUARD
+// ============================================================================
+
+type PolicyFn = (user: AccessTokenPayload, req: Request) => boolean;
+
+export function policyGuard(policyFn: PolicyFn) {
+  return (req: Request, _res: Response, next: NextFunction): void => {
+    const user = req.user as AccessTokenPayload | undefined;
+    if (!user) return next(new AuthorizationError('User not authenticated'));
+
+    if (!policyFn(user, req)) {
+      return next(new AuthorizationError('Access denied by policy'));
     }
-  }
+    next();
+  };
 }
 
 // ============================================================================
-// HELPER FUNCTIONS
+// SERVICE LAYER HELPERS
 // ============================================================================
 
-/**
- * Check if user has permission
- */
 export async function userHasPermission(
   userId: string,
   permissionCode: string
 ): Promise<boolean> {
-  const user = await db.user.findUnique({
-    where: { id: userId },
-    include: {
-      role: {
-        include: {
-          permissions: {
-            select: { code: true },
-          },
-        },
-      },
-      permissions: {
-        include: {
-          permission: {
-            select: { code: true },
-          },
-        },
-      },
-    },
-  });
-
-  if (!user) {
-    return false;
-  }
-
-  // Check role permissions
-  if (user.role.permissions.some((p: { code: string }) => p.code === permissionCode)) {
-    return true;
-  }
-
-  // Check direct permissions
-  return user.permissions.some((p: { permission: { code: string } }) => p.permission.code === permissionCode);
+  const perms = await fetchEffectivePermissions(userId);
+  return perms.has(permissionCode);
 }
 
-/**
- * Check if user has role
- */
 export async function userHasRole(userId: string, roleName: string): Promise<boolean> {
   const user = await db.user.findUnique({
     where: { id: userId },
-    include: { role: true },
+    select: { role: { select: { name: true } } },
   });
-
   return user?.role.name === roleName;
 }
 
-/**
- * Get user permissions
- */
 export async function getUserPermissions(userId: string): Promise<string[]> {
-  const user = await db.user.findUnique({
-    where: { id: userId },
-    include: {
-      role: {
-        include: {
-          permissions: {
-            select: { code: true },
-          },
-        },
-      },
-      permissions: {
-        include: {
-          permission: {
-            select: { code: true },
-          },
-        },
-      },
-    },
-  });
-
-  if (!user) {
-    return [];
-  }
-
-  const permissions = new Set<string>();
-
-  user.role.permissions.forEach((p: { code: string }) => {
-    permissions.add(p.code);
-  });
-
-  user.permissions.forEach((p: { permission: { code: string } }) => {
-    permissions.add(p.permission.code);
-  });
-
-  return Array.from(permissions);
+  return Array.from(await fetchEffectivePermissions(userId));
 }

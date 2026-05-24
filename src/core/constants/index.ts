@@ -1,10 +1,19 @@
 /**
  * Core application constants
+ *
+ * Changes:
+ * - PASSWORD_POLICY.EXPIRY_DAYS renamed to EXPIRE_DAYS for consistency with
+ *   env var PASSWORD_EXPIRE_DAYS used in config. The original had both
+ *   EXPIRY_DAYS (in constants) and EXPIRE_DAYS references in auth.service.ts
+ *   causing runtime undefined access.
+ * - TOKEN_EXPIRY now includes OTP_TOKEN, EMAIL_VERIFICATION_TOKEN, and
+ *   RESET_PASSWORD_TOKEN so auth.service.ts doesn't access undefined keys.
+ * - SECURITY.OTP_LENGTH added so auth.service.ts references don't fail.
+ * - Added PASSWORD_POLICY.SPECIAL_CHARS regex string (not plain chars) for
+ *   correct use in RegExp constructor without escaping foot-guns.
+ * - RATE_LIMIT values now reference TIME constants for readability.
  */
 
-// ============================================================================
-// USER ROLES
-// ============================================================================
 export const ROLES = {
   SUPER_ADMIN: 'SUPER_ADMIN',
   SYSTEM_ADMIN: 'SYSTEM_ADMIN',
@@ -21,7 +30,7 @@ export const ROLES = {
   EMPLOYEE: 'EMPLOYEE',
 } as const;
 
-export type RoleTypeVal = typeof ROLES[keyof typeof ROLES];
+export type RoleTypeVal = (typeof ROLES)[keyof typeof ROLES];
 
 export const PERMISSION_CODES = {
   USERS_CREATE: 'users:create',
@@ -30,7 +39,6 @@ export const PERMISSION_CODES = {
   USERS_DELETE: 'users:delete',
   USERS_MANAGE_ROLES: 'users:manage_roles',
   USERS_MANAGE_PERMISSIONS: 'users:manage_permissions',
-
 
   AUDIT_READ: 'audit:read',
   AUDIT_EXPORT: 'audit:export',
@@ -50,6 +58,14 @@ export const PERMISSION_CODES = {
   FEATURE_FLAGS_MANAGE: 'feature_flags:manage',
 } as const;
 
+export type PermissionCode = (typeof PERMISSION_CODES)[keyof typeof PERMISSION_CODES];
+
+/**
+ * Password policy.
+ * EXPIRE_DAYS (not EXPIRY_DAYS) to match env var name and auth service usage.
+ * SPECIAL_CHARS_REGEX is a ready-to-use RegExp source string for safe use in
+ * new RegExp(SPECIAL_CHARS_REGEX).
+ */
 export const PASSWORD_POLICY = {
   MIN_LENGTH: 12,
   MAX_LENGTH: 128,
@@ -57,10 +73,14 @@ export const PASSWORD_POLICY = {
   REQUIRE_LOWERCASE: true,
   REQUIRE_NUMBERS: true,
   REQUIRE_SPECIAL_CHARS: true,
-  SPECIAL_CHARS: "!@#$%^&*()_+[]{}|;:,.<>?/~", // Add this line
+  /** Plain character set for display messages */
+  SPECIAL_CHARS: '!@#$%^&*()_+[]{}|;:,.<>?/~',
+  /** Pre-escaped regex source for constructing RegExp safely */
+  SPECIAL_CHARS_REGEX: '[!@#$%^&*()_+\\[\\]{}|;:,.<>?/~]',
   HISTORY_COUNT: 5,
-  EXPIRY_DAYS: 90,
-};
+  /** Days until password expires */
+  EXPIRE_DAYS: 90,
+} as const;
 
 export const SECURITY = {
   MAX_LOGIN_ATTEMPTS: 5,
@@ -69,16 +89,18 @@ export const SECURITY = {
   CHALLENGE_TOKEN_EXPIRY_MINUTES: 5,
   EMAIL_TOKEN_EXPIRY_HOURS: 24,
   PASSWORD_RESET_EXPIRY_HOURS: 1,
-};
+  /** Length of numeric OTP codes */
+  OTP_LENGTH: 6,
+} as const;
 
 export const TOKEN_EXPIRY = {
   ACCESS_TOKEN: '15m',
   REFRESH_TOKEN: '7d',
-};
+  OTP_TOKEN: '5m',
+  EMAIL_VERIFICATION_TOKEN: '24h',
+  RESET_PASSWORD_TOKEN: '1h',
+} as const;
 
-// ============================================================================
-// OTP TYPES
-// ============================================================================
 export const OTP_TYPE = {
   EMAIL_VERIFICATION: 'EMAIL_VERIFICATION',
   PHONE_VERIFICATION: 'PHONE_VERIFICATION',
@@ -87,9 +109,6 @@ export const OTP_TYPE = {
   LOGIN_VERIFICATION: 'LOGIN_VERIFICATION',
 } as const;
 
-// ============================================================================
-// AUDIT ACTIONS
-// ============================================================================
 export const AUDIT_ACTION = {
   CREATE: 'CREATE',
   READ: 'READ',
@@ -103,9 +122,6 @@ export const AUDIT_ACTION = {
   IMPORT: 'IMPORT',
 } as const;
 
-// ============================================================================
-// SECURITY EVENT TYPES
-// ============================================================================
 export const SECURITY_EVENT_TYPE = {
   LOGIN_SUCCESS: 'LOGIN_SUCCESS',
   LOGIN_FAILURE: 'LOGIN_FAILURE',
@@ -124,9 +140,6 @@ export const SECURITY_EVENT_TYPE = {
   RESOURCE_DELETED: 'RESOURCE_DELETED',
 } as const;
 
-// ============================================================================
-// NOTIFICATION TYPES
-// ============================================================================
 export const NOTIFICATION_TYPE = {
   TRANSACTION_ALERT: 'TRANSACTION_ALERT',
   SECURITY_ALERT: 'SECURITY_ALERT',
@@ -138,9 +151,6 @@ export const NOTIFICATION_TYPE = {
   ERROR_NOTIFICATION: 'ERROR_NOTIFICATION',
 } as const;
 
-// ============================================================================
-// HTTP STATUS CODES
-// ============================================================================
 export const HTTP_STATUS = {
   OK: 200,
   CREATED: 201,
@@ -156,9 +166,6 @@ export const HTTP_STATUS = {
   SERVICE_UNAVAILABLE: 503,
 } as const;
 
-// ============================================================================
-// TIME CONSTANTS (in milliseconds)
-// ============================================================================
 export const TIME = {
   MINUTE: 60 * 1000,
   HOUR: 60 * 60 * 1000,
@@ -168,28 +175,19 @@ export const TIME = {
   YEAR: 365 * 24 * 60 * 60 * 1000,
 } as const;
 
-// ============================================================================
-// PAGINATION DEFAULTS
-// ============================================================================
 export const PAGINATION = {
   DEFAULT_PAGE: 1,
   DEFAULT_LIMIT: 20,
   MAX_LIMIT: 100,
 } as const;
 
-// ============================================================================
-// RATE LIMITING
-// ============================================================================
 export const RATE_LIMIT = {
-  WINDOW_MS: 15 * 60 * 1000, // 15 minutes
+  WINDOW_MS: 15 * TIME.MINUTE,
   MAX_REQUESTS: 100,
-  LOGIN_WINDOW_MS: 15 * 60 * 1000,
+  LOGIN_WINDOW_MS: 15 * TIME.MINUTE,
   LOGIN_MAX_REQUESTS: 5,
 } as const;
 
-// ============================================================================
-// MODULES
-// ============================================================================
 export const MODULES = {
   AUTH: 'auth',
   USERS: 'users',
@@ -200,33 +198,23 @@ export const MODULES = {
   SETTINGS: 'settings',
 } as const;
 
-// ============================================================================
-// SYSTEM ADMIN ROLE PERMISSIONS (seed data)
-// ============================================================================
-export const SYSTEM_ADMIN_PERMISSIONS = [
-  // User Management - Full access
+export const SYSTEM_ADMIN_PERMISSIONS: readonly string[] = [
   PERMISSION_CODES.USERS_CREATE,
   PERMISSION_CODES.USERS_READ,
   PERMISSION_CODES.USERS_UPDATE,
   PERMISSION_CODES.USERS_DELETE,
   PERMISSION_CODES.USERS_MANAGE_ROLES,
   PERMISSION_CODES.USERS_MANAGE_PERMISSIONS,
-
-  // Audit & Security - Full access
   PERMISSION_CODES.AUDIT_READ,
   PERMISSION_CODES.AUDIT_EXPORT,
   PERMISSION_CODES.SECURITY_EVENTS_READ,
   PERMISSION_CODES.SECURITY_EVENTS_MANAGE,
-
-  // Role & Permission Management - Full access
   PERMISSION_CODES.ROLES_CREATE,
   PERMISSION_CODES.ROLES_READ,
   PERMISSION_CODES.ROLES_UPDATE,
   PERMISSION_CODES.ROLES_DELETE,
   PERMISSION_CODES.PERMISSIONS_READ,
   PERMISSION_CODES.PERMISSIONS_MANAGE,
-
-  // System Settings - Full access
   PERMISSION_CODES.SETTINGS_READ,
   PERMISSION_CODES.SETTINGS_UPDATE,
   PERMISSION_CODES.FEATURE_FLAGS_MANAGE,

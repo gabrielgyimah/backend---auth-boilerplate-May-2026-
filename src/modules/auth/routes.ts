@@ -1,41 +1,74 @@
 /**
  * Auth Routes
- * Defines all authentication endpoints
- * 
- * FIXES:
- * - Added email verification endpoint
- * - Logout now uses authenticate middleware
- * - 2FA verify-login now accepts trustDevice flag (body)
+ *
+ * Changes:
+ * - Added dedicated strict rate-limiter on login, verify-login, and password-reset
+ *   endpoints (5 req / 15 min per IP). The global limiter in app.ts is 100 req/15 min
+ *   which is far too permissive for brute-force-sensitive endpoints.
+ * - /refresh now reads token from HttpOnly cookie only (cookie-parser must be
+ *   applied in app.ts before this router).
+ * - Removed inline arrow-function wrappers — controller methods are already bound
+ *   correctly via class instantiation; binding is unnecessary noise.
  */
 
 import { Router } from 'express';
+import rateLimit from 'express-rate-limit';
 import { authenticate } from '@/core/middlewares/auth.middleware';
 import { authController } from '@/modules/auth/controllers/auth.controller';
+import { RATE_LIMIT } from '@/core/constants';
 
 const router = Router();
 
-// Registration & Email Verification
-router.post('/register', (req, res, next) => authController.register(req, res, next));
-router.post('/verify-email', (req, res, next) => authController.verifyEmail(req, res, next));
+// Strict limiter for authentication-sensitive routes
+const authLimiter = rateLimit({
+  windowMs: RATE_LIMIT.LOGIN_WINDOW_MS,
+  max: RATE_LIMIT.LOGIN_MAX_REQUESTS,
+  message: 'Too many attempts. Please try again in 15 minutes.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: false,
+});
 
-// Login & 2FA
-router.post('/login', (req, res, next) => authController.login(req, res, next));
-router.post('/2fa/verify-login', (req, res, next) => authController.verifyLoginOtp(req, res, next));
+// ============================================================================
+// REGISTRATION & EMAIL VERIFICATION
+// ============================================================================
 
-// Token Refresh
-router.post('/refresh', (req, res, next) => authController.refreshToken(req, res, next));
+router.post('/register', authLimiter, authController.register.bind(authController));
+router.post('/verify-email', authController.verifyEmail.bind(authController));
 
-// Logout (requires authentication)
-router.post('/logout', authenticate, (req, res, next) => authController.logout(req, res, next));
+// ============================================================================
+// LOGIN & 2FA
+// ============================================================================
 
-// Password Management
-router.post('/password/reset-request', (req, res, next) => authController.requestPasswordReset(req, res, next));
-router.post('/password/reset', (req, res, next) => authController.resetPassword(req, res, next));
-router.post('/password/change', authenticate, (req, res, next) => authController.changePassword(req, res, next));
+router.post('/login', authLimiter, authController.login.bind(authController));
+router.post('/2fa/verify-login', authLimiter, authController.verifyLoginOtp.bind(authController));
 
-// 2FA Account Settings (authenticated)
-router.post('/2fa/enable', authenticate, (req, res, next) => authController.enableTwoFactor(req, res, next));
-router.post('/2fa/verify', authenticate, (req, res, next) => authController.verifyTwoFactorOtp(req, res, next));
-router.post('/2fa/disable', authenticate, (req, res, next) => authController.disableTwoFactor(req, res, next));
+// ============================================================================
+// TOKEN MANAGEMENT
+// ============================================================================
+
+router.post('/refresh', authController.refreshToken.bind(authController));
+
+// ============================================================================
+// LOGOUT (requires valid access token)
+// ============================================================================
+
+router.post('/logout', authenticate, authController.logout.bind(authController));
+
+// ============================================================================
+// PASSWORD MANAGEMENT
+// ============================================================================
+
+router.post('/password/reset-request', authLimiter, authController.requestPasswordReset.bind(authController));
+router.post('/password/reset', authLimiter, authController.resetPassword.bind(authController));
+router.post('/password/change', authenticate, authController.changePassword.bind(authController));
+
+// ============================================================================
+// 2FA ACCOUNT SETTINGS (authenticated)
+// ============================================================================
+
+router.post('/2fa/enable', authenticate, authController.enableTwoFactor.bind(authController));
+router.post('/2fa/verify', authenticate, authController.verifyTwoFactorOtp.bind(authController));
+router.post('/2fa/disable', authenticate, authController.disableTwoFactor.bind(authController));
 
 export default router;

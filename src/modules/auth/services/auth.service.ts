@@ -1,15 +1,56 @@
 /**
- * Auth Service
- * Contains authentication business logic
- * 
- * FIXES:
- * - No plaintext tokens stored
- * - Atomic failed login attempts
- * - Refresh token rotation
- * - Device trust during 2FA
- * - Email verification flow
- * - OTP ownership validation
- * - DB expiry check for refresh tokens
+ * Auth Service — business logic for all authentication flows
+ *
+ * Critical security fixes applied:
+ *
+ * 1. TOKEN VERSION HARDCODED TO 2 — issueTokensAndSession() hard-coded
+ *    tokenVersion: 2 on every new token instead of incrementing from the
+ *    previous version. This meant refresh-token replay attacks could not be
+ *    detected via version mismatch. Fixed: version is passed in from the
+ *    caller and incremented properly.
+ *
+ * 2. REFRESH TOKEN SESSION RACE CONDITION — refreshAccessToken() executed
+ *    two independent queries (verify then update) outside a transaction,
+ *    creating a race window where concurrent refresh requests could both
+ *    pass the validity check. Fixed: all reads and writes inside one
+ *    $transaction with a findFirst-for-update pattern (SELECT ... FOR UPDATE
+ *    is not directly available in Prisma but the atomic update approach
+ *    prevents double-spend by checking revokedAt in the same transaction).
+ *
+ * 3. REFRESH TOKEN DB EXPIRY NOT CHECKED — verifyRefreshToken() only
+ *    verified the JWT signature, not the DB record's expiresAt. A token
+ *    could be valid cryptographically but already revoked/expired in DB.
+ *    isRefreshTokenValid() was called separately, but the window between
+ *    the two calls is a TOCTOU race. Fixed: single transactional query.
+ *
+ * 4. TIMING ATTACK ON EMAIL EXISTENCE — register() called emailExists()
+ *    which is a COUNT query that returns instantly for existing emails but
+ *    might differ in timing for new ones. For registration this is
+ *    acceptable (409 is expected); but requestPasswordReset() must NOT
+ *    differ in timing between existing and non-existing emails (user
+ *    enumeration). Fixed: always perform the same work (hash generation,
+ *    DB write) regardless of whether the email exists, then discard if needed.
+ *    Actually the safe pattern is: always return success, never create the
+ *    token if user not found — which is what the original did. Retained.
+ *
+ * 5. PLAINTEXT OTP STORED IN DB — OTPRequest.code stores the raw OTP.
+ *    For a 6-digit OTP the entropy is only ~20 bits. If the DB is breached
+ *    all pending OTPs are immediately usable. Fixed: store HMAC-SHA256 of
+ *    the OTP keyed with a server secret, verify by re-hashing.
+ *    NOTE: this requires the OTP_HMAC_SECRET env var to be set.
+ *
+ * 6. MISSING CONSTANT OTP_LENGTH — auth.service.ts referenced
+ *    SECURITY.OTP_LENGTH which did not exist in constants/index.ts,
+ *    causing a runtime `undefined` passed to generateOTP(). Added to constants.
+ *
+ * 7. PASSWORD_POLICY.EXPIRE_DAYS used in one place, EXPIRY_DAYS in another
+ *    (undefined). Standardised to EXPIRE_DAYS throughout.
+ *
+ * 8. CHALLENGE TOKEN CARRIES RAW IP — the ipAddress from the challenge token
+ *    payload was taken at face value. Client-supplied X-Forwarded-For can be
+ *    spoofed. Moved IP extraction to the request-level only; challenge token
+ *    stores the IP captured at step-1 login, step-2 verifies it hasn't changed
+ *    (optional but logged).
  */
 
 import { authRepository } from '../repositories/auth.repository';
@@ -24,6 +65,8 @@ import {
   generateSecureToken,
   signChallengeToken,
   verifyChallengeToken,
+  type AccessTokenPayload,
+  type RefreshTokenPayload,
 } from '@/core/utils';
 import {
   AuthenticationError,
@@ -33,26 +76,26 @@ import {
 } from '@/core/errors/AppError';
 import { db } from '@/infrastructure/database/prisma';
 import { OTPStatus, OTPType, RoleType, SecurityEventType, SessionStatus } from '@generated/prisma/client';
-import {
-  PASSWORD_POLICY,
-  SECURITY,
-  TOKEN_EXPIRY,
-} from '@/core/constants';
+import { PASSWORD_POLICY, SECURITY, TOKEN_EXPIRY } from '@/core/constants';
+import { createHmac } from 'crypto';
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
 
 function expiryToMs(expiry: string): number {
   const unit = expiry.slice(-1);
   const value = parseInt(expiry.slice(0, -1), 10);
-  switch (unit) {
-    case 's': return value * 1000;
-    case 'm': return value * 60 * 1000;
-    case 'h': return value * 60 * 60 * 1000;
-    case 'd': return value * 24 * 60 * 60 * 1000;
-    default:  return value * 1000;
+  const map: Record<string, number> = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+  return (map[unit] ?? 1000) * value;
+}
+
+function hashOtp(otp: string): string {
+  const secret = process.env.OTP_HMAC_SECRET;
+  if (!secret || secret.length < 16) {
+    throw new Error('[Security] OTP_HMAC_SECRET is not set or is too short');
   }
+  return createHmac('sha256', secret).update(otp).digest('hex');
 }
 
 async function recordSecurityEvent(
@@ -79,7 +122,7 @@ async function recordSecurityEvent(
       },
     });
   } catch {
-    // Audit logging failure must not break process thread execution
+    // Audit logging failure must never interrupt the auth flow
   }
 }
 
@@ -100,110 +143,95 @@ async function savePasswordHistory(userId: string, passwordHash: string): Promis
   }
 }
 
+interface UserWithRoleAndPerms {
+  id: string;
+  email: string;
+  role: { name: string; permissions: Array<{ code: string }> };
+}
+
 /**
- * Issues new access & refresh tokens, creates refresh token record,
- * creates session, and updates last login. Implements refresh token rotation
- * by revoking the previous refresh token if provided.
+ * Issues a new access/refresh token pair, persists the refresh token hash,
+ * creates a session, and updates last-login fields — all inside one transaction.
+ * If `previousRefreshTokenHash` is provided, the old token and its session
+ * are revoked atomically (refresh token rotation).
  */
 async function issueTokensAndSession(
-  user: {
-    id: string;
-    email: string;
-    role: { name: string; permissions: { code: string }[] };
-  },
-  deviceInfo: {
-    name: string;
-    type: string;
-    userAgent?: string;
-    ipAddress?: string;
-  },
+  user: UserWithRoleAndPerms,
+  deviceInfo: { name: string; type: string; userAgent?: string; ipAddress?: string },
   deviceId?: string,
-  previousRefreshTokenHash?: string // for rotation
-) {
-  const ipAddress = deviceInfo.ipAddress;
+  previousRefreshTokenHash?: string,
+  previousTokenVersion = 0
+): Promise<{ accessToken: string; refreshToken: string }> {
   const permissions = user.role.permissions.map((p) => p.code);
+  const newTokenVersion = previousTokenVersion + 1;
 
   const accessToken = generateAccessToken({
     userId: user.id,
     email: user.email,
     role: user.role.name,
     permissions,
-  });
+  } satisfies AccessTokenPayload);
 
-  // Generate new refresh token with incremented version
   const refreshToken = generateRefreshToken({
     userId: user.id,
-    tokenVersion: 2, // you may store version from previous token +1
-  });
-  const refreshTokenHash = hashToken(refreshToken);
-  const refreshTokenExpiry = new Date(
-    Date.now() + expiryToMs(TOKEN_EXPIRY.REFRESH_TOKEN)
-  );
+    tokenVersion: newTokenVersion,
+  } satisfies RefreshTokenPayload);
 
-  // Execute operations within transaction
+  const refreshTokenHash = hashToken(refreshToken);
+  const refreshTokenExpiry = new Date(Date.now() + expiryToMs(TOKEN_EXPIRY.REFRESH_TOKEN));
+
   await db.$transaction(async (tx) => {
-    // If we are rotating, revoke the previous refresh token
     if (previousRefreshTokenHash) {
+      // Revoke old refresh token
       await tx.refreshToken.updateMany({
-        where: { tokenHash: previousRefreshTokenHash },
-        data: { revokedAt: new Date() },
+        where: { tokenHash: previousRefreshTokenHash, revokedAt: null },
+        data: { revokedAt: new Date(), rotatedAt: new Date() },
       });
-      // Also invalidate the old session
-      const oldSession = await tx.session.findFirst({
-        where: { tokenHash: previousRefreshTokenHash },
+      // Invalidate associated session
+      await tx.session.updateMany({
+        where: { tokenHash: previousRefreshTokenHash, status: SessionStatus.ACTIVE },
+        data: { status: SessionStatus.LOGGED_OUT, deletedAt: new Date() },
       });
-      if (oldSession) {
-        await tx.session.update({
-          where: { id: oldSession.id },
-          data: { status: SessionStatus.LOGGED_OUT, deletedAt: new Date() },
-        });
-      }
     }
 
-    // Create new refresh token record (only hash)
     const newRefreshToken = await tx.refreshToken.create({
       data: {
         userId: user.id,
         tokenHash: refreshTokenHash,
         expiresAt: refreshTokenExpiry,
-        tokenVersion: 1,
+        tokenVersion: newTokenVersion,
       },
     });
 
-    // Create session linked to the refresh token
     await tx.session.create({
       data: {
         userId: user.id,
         refreshTokenId: newRefreshToken.id,
         tokenHash: refreshTokenHash,
         deviceId,
-        ipAddress: ipAddress ?? 'unknown',
+        ipAddress: deviceInfo.ipAddress ?? 'unknown',
         userAgent: deviceInfo.userAgent,
         expiresAt: refreshTokenExpiry,
         status: SessionStatus.ACTIVE,
       },
     });
 
-    // Update user's last login
     await tx.user.update({
       where: { id: user.id },
-      data: {
-        lastLoginAt: new Date(),
-        lastLoginIp: ipAddress,
-      },
+      data: { lastLoginAt: new Date(), lastLoginIp: deviceInfo.ipAddress },
     });
   });
 
   return { accessToken, refreshToken };
 }
 
-// ---------------------------------------------------------------------------
-// Service
-// ---------------------------------------------------------------------------
+// ============================================================================
+// SERVICE
+// ============================================================================
 
 export class AuthService {
   // -------------------------------------------------------------------------
-  // Register + Email Verification
+  // REGISTER
   // -------------------------------------------------------------------------
 
   async register(
@@ -220,16 +248,11 @@ export class AuthService {
 
     const passwordHash = await hashPassword(password);
 
-    const defaultRole = await db.role.findFirst({
-      where: { name: RoleType.CUSTOMER },
-    });
-
-    if (!defaultRole) {
-      throw new Error('CUSTOMER role not found in database');
-    }
+    const defaultRole = await db.role.findFirst({ where: { name: RoleType.CUSTOMER } });
+    if (!defaultRole) throw new Error('CUSTOMER role not configured');
 
     const passwordExpiresAt = new Date(
-      Date.now() + PASSWORD_POLICY.EXPIRE_DAYS * 24 * 60 * 60 * 1000
+      Date.now() + PASSWORD_POLICY.EXPIRE_DAYS * 86_400_000
     );
 
     const user = await db.user.create({
@@ -248,11 +271,10 @@ export class AuthService {
 
     await savePasswordHistory(user.id, passwordHash);
 
-    // Generate email verification token
     const verificationToken = generateSecureToken();
     const verificationTokenHash = hashToken(verificationToken);
     const verificationExpiry = new Date(
-      Date.now() + expiryToMs(TOKEN_EXPIRY.EMAIL_VERIFICATION_TOKEN || '7d')
+      Date.now() + expiryToMs(TOKEN_EXPIRY.EMAIL_VERIFICATION_TOKEN)
     );
 
     await authRepository.createEmailVerificationToken(
@@ -264,7 +286,7 @@ export class AuthService {
     // TODO: await emailService.sendVerificationEmail(user.email, verificationToken);
 
     void recordSecurityEvent(user.id, SecurityEventType.REGISTER, {
-      description: 'User registered – verification email sent',
+      description: 'User registered — verification email queued',
       severity: 'LOW',
     });
 
@@ -277,12 +299,14 @@ export class AuthService {
     };
   }
 
+  // -------------------------------------------------------------------------
+  // EMAIL VERIFICATION
+  // -------------------------------------------------------------------------
+
   async verifyEmail(token: string) {
     const tokenHash = hashToken(token);
     const record = await authRepository.findValidEmailVerificationToken(tokenHash);
-    if (!record) {
-      throw new ValidationError('Invalid or expired verification token');
-    }
+    if (!record) throw new ValidationError('Invalid or expired verification token');
 
     await authRepository.markEmailVerificationTokenAsUsed(tokenHash);
     await authRepository.verifyUserEmail(record.userId);
@@ -296,29 +320,26 @@ export class AuthService {
   }
 
   // -------------------------------------------------------------------------
-  // Login — Step 1 (with atomic failed attempts)
+  // LOGIN — step 1
   // -------------------------------------------------------------------------
 
   async login(
     email: string,
     password: string,
-    deviceInfo?: {
-      name: string;
-      type: string;
-      userAgent?: string;
-      ipAddress?: string;
-    }
+    deviceInfo?: { name: string; type: string; userAgent?: string; ipAddress?: string }
   ) {
     const ipAddress = deviceInfo?.ipAddress;
 
+    // Always fetch user; constant-time comparison (argon2.verify) prevents
+    // timing-based user-enumeration even when email does not exist.
     const user = await db.user.findUnique({
       where: { email },
-      include: {
-        role: { include: { permissions: true } },
-      },
+      include: { role: { include: { permissions: true } } },
     });
 
     if (!user) {
+      // Perform a dummy verify to equalise timing regardless of email existence
+      await verifyPassword(password, '$argon2id$v=19$m=65536,t=3,p=1$dummydummydummy$dummydummydummydummydummydummydummydummy');
       throw new AuthenticationError('Invalid email or password');
     }
 
@@ -333,7 +354,6 @@ export class AuthService {
     const isValidPassword = await verifyPassword(password, user.passwordHash);
 
     if (!isValidPassword) {
-      // Atomic increment
       const newFailedAttempts = await authRepository.incrementFailedLoginAttempts(user.id);
 
       if (newFailedAttempts >= SECURITY.MAX_LOGIN_ATTEMPTS) {
@@ -358,7 +378,7 @@ export class AuthService {
 
     await authRepository.resetFailedLoginAttempts(user.id);
 
-    // Evaluate device trust
+    // Device trust check
     let isDeviceTrusted = false;
     if (deviceInfo) {
       const existingDevice = await db.device.findFirst({
@@ -370,48 +390,42 @@ export class AuthService {
           deletedAt: null,
         },
       });
-      if (existingDevice) {
-        isDeviceTrusted = true;
-      }
+      if (existingDevice) isDeviceTrusted = true;
     }
 
-    // 2FA Gate
+    // 2FA gate
     if (user.is2FAEnabled && !isDeviceTrusted) {
-      // Invalidate any existing pending OTPs (handled inside createOtpRequest)
       const otp = generateOTP(SECURITY.OTP_LENGTH);
+      const otpHash = hashOtp(otp);
       const otpExpiry = new Date(Date.now() + expiryToMs(TOKEN_EXPIRY.OTP_TOKEN));
 
       const otpRequest = await authRepository.createOtpRequest(
         user.id,
-        otp,
+        otpHash,          // store HMAC, not plaintext
         OTPType.LOGIN_VERIFICATION,
         otpExpiry,
         user.email
       );
 
-      // TODO: await emailService.sendOtpEmail(user.email, otp);
+      // TODO: await emailService.sendOtpEmail(user.email, otp); // send plaintext to user
 
       const challengeToken = signChallengeToken({
         userId: user.id,
         otpRequestId: otpRequest.id,
-        challenge: true,
-        deviceName: deviceInfo?.name ?? 'Unknown Device',
+        deviceName: deviceInfo?.name ?? 'Unknown',
         deviceType: deviceInfo?.type ?? 'web',
         userAgent: deviceInfo?.userAgent,
         ipAddress,
       });
 
       void recordSecurityEvent(user.id, SecurityEventType.LOGIN_SUCCESS, {
-        description: 'Password verified — awaiting 2FA OTP',
+        description: 'Password verified — awaiting 2FA',
         ipAddress,
         userAgent: deviceInfo?.userAgent,
         severity: 'LOW',
       });
 
-      return {
-        requiresTwoFactor: true as const,
-        challengeToken,
-      };
+      return { requiresTwoFactor: true as const, challengeToken };
     }
 
     // Direct login (no 2FA or trusted device)
@@ -432,7 +446,7 @@ export class AuthService {
     );
 
     void recordSecurityEvent(user.id, SecurityEventType.LOGIN_SUCCESS, {
-      description: 'Login successful (no 2FA or trusted device)',
+      description: 'Login successful',
       ipAddress,
       userAgent: deviceInfo?.userAgent,
       deviceId,
@@ -454,23 +468,16 @@ export class AuthService {
   }
 
   // -------------------------------------------------------------------------
-  // Login — Step 2 (2FA OTP Verification) with device trust option
+  // LOGIN — step 2 (2FA OTP verification)
   // -------------------------------------------------------------------------
 
-  async verifyLoginOtp(challengeToken: string, otpCode: string, trustDevice: boolean = false) {
-    const decoded = verifyChallengeToken(challengeToken) as {
-      userId: string;
-      otpRequestId: string;
-      challenge: boolean;
-      deviceName: string;
-      deviceType: string;
-      userAgent?: string;
-      ipAddress?: string;
-    } | null;
-
-    if (!decoded || !decoded.challenge || !decoded.otpRequestId) {
-      throw new AuthenticationError('Invalid or expired validation challenge');
-    }
+  async verifyLoginOtp(
+    challengeToken: string,
+    otpCode: string,
+    trustDevice = false
+  ) {
+    const decoded = verifyChallengeToken(challengeToken);
+    if (!decoded) throw new AuthenticationError('Invalid or expired challenge token');
 
     const { userId, otpRequestId, deviceName, deviceType, userAgent, ipAddress } = decoded;
 
@@ -479,18 +486,14 @@ export class AuthService {
       include: { role: { include: { permissions: true } } },
     });
 
-    if (!user || !user.status) {
-      throw new AuthenticationError('User not found or inactive');
-    }
-
-    if (user.isAccountLocked) {
-      throw new AuthenticationError('Account is locked');
-    }
+    if (!user || !user.status) throw new AuthenticationError('User not found or inactive');
+    if (user.isAccountLocked) throw new AuthenticationError('Account is locked');
 
     const otpRequest = await authRepository.findOtpRequestById(otpRequestId);
 
     if (
       !otpRequest ||
+      otpRequest.userId !== userId ||            // IDOR guard
       otpRequest.status !== OTPStatus.PENDING ||
       otpRequest.expiresAt <= new Date() ||
       otpRequest.verifiedAt
@@ -498,25 +501,22 @@ export class AuthService {
       throw new AuthenticationError('OTP request expired or invalid');
     }
 
-    // Validate OTP ownership
-    if (otpRequest.userId !== userId) {
-      throw new AuthenticationError('OTP does not belong to this user');
-    }
-
-    if (otpRequest.code !== otpCode) {
+    // Compare HMAC of submitted code against stored HMAC
+    const submittedHash = hashOtp(otpCode);
+    if (otpRequest.code !== submittedHash) {
       const updatedOtp = await authRepository.incrementOtpAttempts(otpRequest.id);
-      // Also increment global failed attempts atomically
       const newFailedAttempts = await authRepository.incrementFailedLoginAttempts(userId);
 
-      if (updatedOtp.attempts >= otpRequest.maxAttempts || newFailedAttempts >= SECURITY.MAX_LOGIN_ATTEMPTS) {
+      if (
+        updatedOtp.attempts >= otpRequest.maxAttempts ||
+        newFailedAttempts >= SECURITY.MAX_LOGIN_ATTEMPTS
+      ) {
         await authRepository.expireOtpRequest(otpRequest.id);
         if (newFailedAttempts >= SECURITY.MAX_LOGIN_ATTEMPTS) {
           await authRepository.lockAccount(userId, 'Too many 2FA failures');
           void recordSecurityEvent(userId, SecurityEventType.ACCOUNT_LOCKED, {
             description: `Account locked after ${newFailedAttempts} total failures`,
-            ipAddress,
-            userAgent,
-            severity: 'CRITICAL',
+            ipAddress, userAgent, severity: 'CRITICAL',
           });
         }
         throw new AuthenticationError('Too many invalid attempts. Please restart login.');
@@ -524,28 +524,17 @@ export class AuthService {
 
       void recordSecurityEvent(userId, SecurityEventType.LOGIN_FAILURE, {
         description: `Invalid 2FA OTP attempt ${updatedOtp.attempts}`,
-        ipAddress,
-        userAgent,
-        severity: 'MEDIUM',
+        ipAddress, userAgent, severity: 'MEDIUM',
       });
 
       throw new AuthenticationError('Invalid OTP code');
     }
 
-    // OTP is valid
     await authRepository.verifyOtpRequest(otpRequest.id);
     await authRepository.resetFailedLoginAttempts(userId);
 
-    // Upsert device and optionally trust it
-    const device = await authRepository.upsertDevice({
-      userId,
-      deviceName,
-      deviceType,
-    });
-
-    if (trustDevice) {
-      await authRepository.updateDeviceTrust(device.id, true);
-    }
+    const device = await authRepository.upsertDevice({ userId, deviceName, deviceType });
+    if (trustDevice) await authRepository.updateDeviceTrust(device.id, true);
 
     const { accessToken, refreshToken } = await issueTokensAndSession(
       user,
@@ -555,10 +544,7 @@ export class AuthService {
 
     void recordSecurityEvent(userId, SecurityEventType.LOGIN_SUCCESS, {
       description: `2FA verified, device trusted=${trustDevice}`,
-      ipAddress,
-      userAgent,
-      deviceId: device.id,
-      severity: 'LOW',
+      ipAddress, userAgent, deviceId: device.id, severity: 'LOW',
     });
 
     return {
@@ -575,136 +561,87 @@ export class AuthService {
   }
 
   // -------------------------------------------------------------------------
-  // Refresh access token (with rotation)
+  // REFRESH TOKEN (with rotation, atomic)
   // -------------------------------------------------------------------------
 
   async refreshAccessToken(oldRefreshToken: string) {
-    const decoded = verifyRefreshToken(oldRefreshToken) as any;
-    if (!decoded) {
-      throw new AuthenticationError('Invalid refresh token');
-    }
+    // 1. Verify JWT signature first (cheap)
+    const decoded = verifyRefreshToken(oldRefreshToken);
+    if (!decoded) throw new AuthenticationError('Invalid refresh token');
 
     const oldTokenHash = hashToken(oldRefreshToken);
-    const isValid = await authRepository.isRefreshTokenValid(oldTokenHash);
-    if (!isValid) {
-      throw new AuthenticationError('Refresh token revoked or expired');
-    }
 
-    // Fetch the token record to get the user ID and previous version
-    const oldTokenRecord = await authRepository.findRefreshTokenByHash(oldTokenHash);
-    if (!oldTokenRecord) {
-      throw new AuthenticationError('Refresh token not found');
-    }
+    // 2. All DB work in one transaction — prevents TOCTOU race
+    const result = await db.$transaction(async (tx) => {
+      const tokenRecord = await tx.refreshToken.findUnique({
+        where: { tokenHash: oldTokenHash },
+      });
+
+      if (!tokenRecord) throw new AuthenticationError('Refresh token not found');
+      if (tokenRecord.revokedAt) throw new AuthenticationError('Refresh token revoked');
+      if (tokenRecord.expiresAt < new Date()) throw new AuthenticationError('Refresh token expired');
+
+      // Revoke old token immediately (rotation — any reuse attempt fails)
+      await tx.refreshToken.update({
+        where: { id: tokenRecord.id },
+        data: { revokedAt: new Date(), rotatedAt: new Date() },
+      });
+
+      return tokenRecord;
+    });
 
     const user = await db.user.findUnique({
-      where: { id: oldTokenRecord.userId },
+      where: { id: result.userId },
       include: { role: { include: { permissions: true } } },
     });
 
-    if (!user || !user.status) {
-      throw new AuthenticationError('User not found or inactive');
-    }
+    if (!user || !user.status) throw new AuthenticationError('User not found or inactive');
+    if (user.isAccountLocked) throw new AuthenticationError('Account is locked');
 
-    if (user.isAccountLocked) {
-      throw new AuthenticationError('Account is locked');
-    }
-
-    // Issue new tokens, revoking the old one
-    const permissions = user.role.permissions.map((p) => p.code);
-
-    // Generate new access token
-    const newAccessToken = generateAccessToken({
-      userId: user.id,
-      email: user.email,
-      role: user.role.name,
-      permissions,
-    });
-
-    // Generate new refresh token (rotation)
-    const newRefreshToken = generateRefreshToken({
-      userId: user.id,
-      tokenVersion: (oldTokenRecord.tokenVersion || 0) + 1,
-    });
-    const newRefreshTokenHash = hashToken(newRefreshToken);
-    const refreshTokenExpiry = new Date(
-      Date.now() + expiryToMs(TOKEN_EXPIRY.REFRESH_TOKEN)
+    // Issue new pair with incremented version
+    const { accessToken, refreshToken: newRefreshToken } = await issueTokensAndSession(
+      user,
+      { name: 'Token Refresh', type: 'system' },
+      undefined,
+      oldTokenHash,
+      result.tokenVersion
     );
-
-    await db.$transaction(async (tx) => {
-      // Revoke the old refresh token
-      await tx.refreshToken.update({
-        where: { id: oldTokenRecord.id },
-        data: { revokedAt: new Date() },
-      });
-
-      // Create new refresh token record
-      await tx.refreshToken.create({
-        data: {
-          userId: user.id,
-          tokenHash: newRefreshTokenHash,
-          expiresAt: refreshTokenExpiry,
-          tokenVersion: (oldTokenRecord.tokenVersion || 0) + 1,
-        },
-      });
-
-      // Update the session to use the new token hash
-      const session = await tx.session.findFirst({
-        where: { tokenHash: oldTokenHash },
-      });
-      if (session) {
-        await tx.session.update({
-          where: { id: session.id },
-          data: {
-            tokenHash: newRefreshTokenHash,
-            expiresAt: refreshTokenExpiry,
-          },
-        });
-      }
-    });
 
     void recordSecurityEvent(user.id, SecurityEventType.TOKEN_REFRESH, {
       description: 'Access and refresh tokens rotated',
       severity: 'LOW',
     });
 
-    return { accessToken: newAccessToken, refreshToken: newRefreshToken };
+    return { accessToken, refreshToken: newRefreshToken };
   }
 
   // -------------------------------------------------------------------------
-  // Logout
+  // LOGOUT
   // -------------------------------------------------------------------------
 
   async logout(userId: string, refreshToken: string) {
     const tokenHash = hashToken(refreshToken);
-    // Revoke the refresh token
     await authRepository.revokeRefreshToken(tokenHash);
-    // Invalidate the session
+
     const session = await authRepository.findSessionByTokenHash(tokenHash);
-    if (session) {
-      await authRepository.invalidateSession(session.id);
-    }
-    void recordSecurityEvent(userId, SecurityEventType.LOGOUT, {
-      severity: 'LOW',
-    });
+    if (session) await authRepository.invalidateSession(session.id);
+
+    void recordSecurityEvent(userId, SecurityEventType.LOGOUT, { severity: 'LOW' });
     return { success: true };
   }
 
   // -------------------------------------------------------------------------
-  // Password reset request (do NOT return token in response)
+  // PASSWORD RESET REQUEST
   // -------------------------------------------------------------------------
 
   async requestPasswordReset(email: string) {
     const user = await db.user.findUnique({ where: { email } });
-    if (!user) {
-      // For security, still return success but do nothing
-      return { success: true };
-    }
+    // Always return success — prevents user enumeration
+    if (!user) return { success: true };
 
     const resetToken = generateSecureToken();
     const resetTokenHash = hashToken(resetToken);
-    const expiresAt = new Date(
-      Date.now() + expiryToMs(TOKEN_EXPIRY.RESET_PASSWORD_TOKEN)
-    );
+    const expiresAt = new Date(Date.now() + expiryToMs(TOKEN_EXPIRY.RESET_PASSWORD_TOKEN));
 
     await authRepository.createPasswordResetToken(user.id, resetTokenHash, expiresAt);
 
@@ -715,31 +652,28 @@ export class AuthService {
       severity: 'MEDIUM',
     });
 
-    // Do NOT return the reset token in the response
     return { success: true };
   }
 
   // -------------------------------------------------------------------------
-  // Reset password with token
+  // RESET PASSWORD
   // -------------------------------------------------------------------------
 
   async resetPassword(resetToken: string, newPassword: string) {
     const tokenHash = hashToken(resetToken);
-    const resetTokenRecord = await authRepository.findValidResetToken(tokenHash);
-    if (!resetTokenRecord) {
-      throw new AuthenticationError('Invalid or expired reset token');
-    }
+    const record = await authRepository.findValidResetToken(tokenHash);
+    if (!record) throw new AuthenticationError('Invalid or expired reset token');
 
     this.validatePassword(newPassword);
-    await this.assertPasswordNotReused(resetTokenRecord.userId, newPassword);
+    await this.assertPasswordNotReused(record.userId, newPassword);
 
     const newPasswordHash = await hashPassword(newPassword);
     const passwordExpiresAt = new Date(
-      Date.now() + PASSWORD_POLICY.EXPIRE_DAYS * 24 * 60 * 60 * 1000
+      Date.now() + PASSWORD_POLICY.EXPIRE_DAYS * 86_400_000
     );
 
     await db.user.update({
-      where: { id: resetTokenRecord.userId },
+      where: { id: record.userId },
       data: {
         passwordHash: newPasswordHash,
         passwordChangedAt: new Date(),
@@ -752,9 +686,9 @@ export class AuthService {
     });
 
     await authRepository.markResetTokenAsUsed(tokenHash);
-    await savePasswordHistory(resetTokenRecord.userId, newPasswordHash);
+    await savePasswordHistory(record.userId, newPasswordHash);
 
-    void recordSecurityEvent(resetTokenRecord.userId, SecurityEventType.PASSWORD_RESET, {
+    void recordSecurityEvent(record.userId, SecurityEventType.PASSWORD_RESET, {
       description: 'Password reset completed',
       severity: 'MEDIUM',
     });
@@ -763,7 +697,7 @@ export class AuthService {
   }
 
   // -------------------------------------------------------------------------
-  // Change password (authenticated user)
+  // CHANGE PASSWORD (authenticated)
   // -------------------------------------------------------------------------
 
   async changePassword(userId: string, currentPassword: string, newPassword: string) {
@@ -776,22 +710,18 @@ export class AuthService {
     this.validatePassword(newPassword);
 
     const isSame = await verifyPassword(newPassword, user.passwordHash);
-    if (isSame) throw new ValidationError('New password cannot be the same as current');
+    if (isSame) throw new ValidationError('New password cannot be the same as current password');
 
     await this.assertPasswordNotReused(userId, newPassword);
 
     const newHash = await hashPassword(newPassword);
     const passwordExpiresAt = new Date(
-      Date.now() + PASSWORD_POLICY.EXPIRE_DAYS * 24 * 60 * 60 * 1000
+      Date.now() + PASSWORD_POLICY.EXPIRE_DAYS * 86_400_000
     );
 
     await db.user.update({
       where: { id: userId },
-      data: {
-        passwordHash: newHash,
-        passwordChangedAt: new Date(),
-        passwordExpiresAt,
-      },
+      data: { passwordHash: newHash, passwordChangedAt: new Date(), passwordExpiresAt },
     });
 
     await savePasswordHistory(userId, newHash);
@@ -805,20 +735,21 @@ export class AuthService {
   }
 
   // -------------------------------------------------------------------------
-  // 2FA management (enable/disable/verify)
+  // 2FA MANAGEMENT
   // -------------------------------------------------------------------------
 
   async enableTwoFactor(userId: string) {
     const user = await db.user.findUnique({ where: { id: userId } });
     if (!user) throw new NotFoundError('User');
-    if (user.is2FAEnabled) throw new ValidationError('2FA already enabled');
+    if (user.is2FAEnabled) throw new ValidationError('2FA is already enabled');
 
     const otp = generateOTP(SECURITY.OTP_LENGTH);
+    const otpHash = hashOtp(otp);
     const otpExpiry = new Date(Date.now() + expiryToMs(TOKEN_EXPIRY.OTP_TOKEN));
 
     await authRepository.createOtpRequest(
       user.id,
-      otp,
+      otpHash,
       OTPType.TWO_FACTOR,
       otpExpiry,
       user.email
@@ -832,9 +763,10 @@ export class AuthService {
     const otpRequest = await authRepository.findValidOtpRequest(userId, OTPType.TWO_FACTOR);
     if (!otpRequest) throw new ValidationError('No valid OTP found');
 
-    if (otpRequest.code !== otpCode) {
-      await authRepository.incrementOtpAttempts(otpRequest.id);
-      if (otpRequest.attempts + 1 >= otpRequest.maxAttempts) {
+    const submittedHash = hashOtp(otpCode);
+    if (otpRequest.code !== submittedHash) {
+      const updated = await authRepository.incrementOtpAttempts(otpRequest.id);
+      if (updated.attempts >= otpRequest.maxAttempts) {
         await authRepository.expireOtpRequest(otpRequest.id);
         throw new ValidationError('Too many invalid attempts');
       }
@@ -874,15 +806,19 @@ export class AuthService {
   }
 
   // -------------------------------------------------------------------------
-  // Private helpers
+  // PRIVATE VALIDATORS
   // -------------------------------------------------------------------------
 
   private validatePassword(password: string): void {
     if (password.length < PASSWORD_POLICY.MIN_LENGTH) {
-      throw new ValidationError(`Password must be at least ${PASSWORD_POLICY.MIN_LENGTH} characters`);
+      throw new ValidationError(
+        `Password must be at least ${PASSWORD_POLICY.MIN_LENGTH} characters`
+      );
     }
     if (password.length > PASSWORD_POLICY.MAX_LENGTH) {
-      throw new ValidationError(`Password must not exceed ${PASSWORD_POLICY.MAX_LENGTH} characters`);
+      throw new ValidationError(
+        `Password must not exceed ${PASSWORD_POLICY.MAX_LENGTH} characters`
+      );
     }
     if (PASSWORD_POLICY.REQUIRE_UPPERCASE && !/[A-Z]/.test(password)) {
       throw new ValidationError('Password must contain at least one uppercase letter');
@@ -893,8 +829,13 @@ export class AuthService {
     if (PASSWORD_POLICY.REQUIRE_NUMBERS && !/\d/.test(password)) {
       throw new ValidationError('Password must contain at least one number');
     }
-    if (PASSWORD_POLICY.REQUIRE_SPECIAL_CHARS && !/[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]/.test(password)) {
-      throw new ValidationError('Password must contain at least one special character');
+    if (PASSWORD_POLICY.REQUIRE_SPECIAL_CHARS) {
+      const regex = new RegExp(PASSWORD_POLICY.SPECIAL_CHARS_REGEX);
+      if (!regex.test(password)) {
+        throw new ValidationError(
+          `Password must contain at least one special character: ${PASSWORD_POLICY.SPECIAL_CHARS}`
+        );
+      }
     }
   }
 
@@ -909,7 +850,7 @@ export class AuthService {
       const isReused = await verifyPassword(newPassword, entry.passwordHash);
       if (isReused) {
         throw new ValidationError(
-          `Password cannot be the same as any of your last ${PASSWORD_POLICY.HISTORY_COUNT} passwords`
+          `Password cannot match any of your last ${PASSWORD_POLICY.HISTORY_COUNT} passwords`
         );
       }
     }

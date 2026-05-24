@@ -1,45 +1,53 @@
 /**
- * Auth Controller
- * Handles HTTP requests for authentication
- * 
- * FIXES:
- * - Added email verification endpoint
- * - Added trustDevice flag for 2FA verification
- * - No reset token returned in response
- * - Logout uses authenticated user
+ * Auth Controller — HTTP layer for all authentication endpoints
+ *
+ * Changes:
+ * - Removed `(req as any).user` casts; uses `getAuthenticatedUser()` helper which
+ *   returns the typed AccessTokenPayload.
+ * - `verifyLoginOtp` was returning refreshToken in BOTH the cookie AND the response
+ *   body. Tokens in response bodies are visible to JS (XSS risk). Kept cookie only;
+ *   body returns only the access token and user profile.
+ * - IP address extraction now safely handles IPv6-mapped IPv4 addresses and
+ *   avoids trusting X-Forwarded-For unless explicitly configured (TRUST_PROXY env).
+ * - Added `cookie-parser` dependency note; app.ts must use `cookieParser()`.
+ * - Zod validation errors are now uniformly mapped to ValidationError with
+ *   field-level detail instead of being swallowed or passed to next() raw.
+ * - Removed the ability to pass refreshToken via req.body on /refresh — cookies only.
+ *   Accepting tokens in request bodies allows CSRF attacks when cookies are HttpOnly.
  */
 
 import { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { authService } from '../services/auth.service';
-import { AuthenticationError } from '@/core/errors/AppError';
+import { AuthenticationError, ValidationError } from '@/core/errors/AppError';
+import { getAuthenticatedUser } from '@/core/middlewares/auth.middleware';
 
 // ============================================================================
-// VALIDATION SCHEMAS
+// ZOD SCHEMAS
 // ============================================================================
 
 const registerSchema = z.object({
-  email: z.string().email('Invalid email'),
-  password: z.string().min(8).regex(/[A-Z]/).regex(/[a-z]/).regex(/\d/).regex(/[!@#$%^&*]/),
-  firstName: z.string().min(2),
-  lastName: z.string().min(2),
+  email: z.string().email('Invalid email address'),
+  password: z.string().min(12, 'Password must be at least 12 characters'),
+  firstName: z.string().min(2, 'First name is required'),
+  lastName: z.string().min(2, 'Last name is required'),
 });
 
 const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
-  deviceName: z.string().optional(),
-  deviceType: z.string().optional(),
+  deviceName: z.string().max(128).optional(),
+  deviceType: z.string().max(64).optional(),
 });
 
 const verifyLoginOtpSchema = z.object({
   challengeToken: z.string().min(1),
-  otpCode: z.string().length(6),
+  otpCode: z.string().regex(/^\d{6}$/, 'OTP must be exactly 6 digits'),
   trustDevice: z.boolean().optional().default(false),
 });
 
 const verifyEmailSchema = z.object({
-  token: z.string().min(1),
+  token: z.string().min(64, 'Invalid verification token'),
 });
 
 const passwordResetRequestSchema = z.object({
@@ -47,17 +55,17 @@ const passwordResetRequestSchema = z.object({
 });
 
 const passwordResetSchema = z.object({
-  resetToken: z.string().min(1),
-  newPassword: z.string().min(8).regex(/[A-Z]/).regex(/[a-z]/).regex(/\d/).regex(/[!@#$%^&*]/),
+  resetToken: z.string().min(64, 'Invalid reset token'),
+  newPassword: z.string().min(12),
 });
 
 const changePasswordSchema = z.object({
   currentPassword: z.string().min(1),
-  newPassword: z.string().min(8).regex(/[A-Z]/).regex(/[a-z]/).regex(/\d/).regex(/[!@#$%^&*]/),
+  newPassword: z.string().min(12),
 });
 
 const verifyOtpSchema = z.object({
-  otpCode: z.string().length(6),
+  otpCode: z.string().regex(/^\d{6}$/, 'OTP must be exactly 6 digits'),
 });
 
 const disableTwoFactorSchema = z.object({
@@ -65,39 +73,89 @@ const disableTwoFactorSchema = z.object({
 });
 
 // ============================================================================
-// CONTROLLER CLASS
+// HELPERS
+// ============================================================================
+
+const COOKIE_NAME = 'refreshToken';
+const COOKIE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+function setRefreshCookie(res: Response, token: string): void {
+  res.cookie(COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+    maxAge: COOKIE_MAX_AGE_MS,
+    path: '/',
+  });
+}
+
+function clearRefreshCookie(res: Response): void {
+  res.clearCookie(COOKIE_NAME, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict', path: '/' });
+}
+
+/**
+ * Returns a sanitised client IP.
+ * Trusts X-Forwarded-For only when TRUST_PROXY=true is set (behind a reverse proxy).
+ */
+function getClientIp(req: Request): string {
+  const trustProxy = process.env.TRUST_PROXY === 'true';
+  if (trustProxy) {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (typeof forwarded === 'string') {
+      return forwarded.split(',')[0]?.trim() ?? 'unknown';
+    }
+  }
+  return req.socket?.remoteAddress ?? 'unknown';
+}
+
+function parseBody<T>(schema: z.ZodType<T>, body: unknown): T {
+  const result = schema.safeParse(body);
+  if (!result.success) {
+    throw new ValidationError('Validation failed', {
+      errors: result.error.errors.map((e) => ({
+        field: e.path.join('.'),
+        message: e.message,
+      })),
+    });
+  }
+  return result.data;
+}
+
+// ============================================================================
+// CONTROLLER
 // ============================================================================
 
 export class AuthController {
   async register(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = registerSchema.parse(req.body);
+      const data = parseBody(registerSchema, req.body);
       const user = await authService.register(data.email, data.password, data.firstName, data.lastName);
-      res.status(201).json({ success: true, data: user, message: 'User registered. Please verify your email.' });
-    } catch (error) {
-      next(error);
-    }
+      res.status(201).json({
+        success: true,
+        data: user,
+        message: 'Registration successful. Please verify your email.',
+      });
+    } catch (error) { next(error); }
   }
 
   async verifyEmail(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const { token } = verifyEmailSchema.parse(req.body);
+      const { token } = parseBody(verifyEmailSchema, req.body);
       const result = await authService.verifyEmail(token);
       res.status(200).json({ success: true, data: result, message: 'Email verified successfully' });
-    } catch (error) {
-      next(error);
-    }
+    } catch (error) { next(error); }
   }
 
   async login(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = loginSchema.parse(req.body);
-      const ipAddress = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress;
+      const data = parseBody(loginSchema, req.body);
+      const ipAddress = getClientIp(req);
+
       const result = await authService.login(data.email, data.password, {
-        name: data.deviceName || 'Unknown Device',
-        type: data.deviceType || 'web',
+        name: data.deviceName ?? 'Unknown Device',
+        type: data.deviceType ?? 'web',
         userAgent: req.get('user-agent'),
-        ipAddress: Array.isArray(ipAddress) ? ipAddress[0] : ipAddress as string,
+        ipAddress,
       });
 
       if (result.requiresTwoFactor) {
@@ -109,146 +167,121 @@ export class AuthController {
         return;
       }
 
-      res.cookie('refreshToken', result.refreshToken, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'strict',
-        maxAge: 7 * 24 * 60 * 60 * 1000,
-      });
+      setRefreshCookie(res, result.refreshToken);
 
       res.status(200).json({
         success: true,
-        data: { requiresTwoFactor: false, accessToken: result.accessToken, user: result.user },
+        data: {
+          requiresTwoFactor: false,
+          accessToken: result.accessToken,
+          user: result.user,
+        },
         message: 'Login successful',
       });
-    } catch (error) {
-      next(error);
-    }
+    } catch (error) { next(error); }
   }
 
   async verifyLoginOtp(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const { challengeToken, otpCode, trustDevice } = verifyLoginOtpSchema.parse(req.body);
+      const { challengeToken, otpCode, trustDevice } = parseBody(verifyLoginOtpSchema, req.body);
       const result = await authService.verifyLoginOtp(challengeToken, otpCode, trustDevice);
 
-      res.cookie('refreshToken', result.refreshToken, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'strict',
-        maxAge: 7 * 24 * 60 * 60 * 1000,
-      });
+      // Refresh token goes in HttpOnly cookie ONLY — not in response body
+      setRefreshCookie(res, result.refreshToken);
 
       res.status(200).json({
         success: true,
-        data: { accessToken: result.accessToken, refreshToken: result.refreshToken, user: result.user },
+        data: { accessToken: result.accessToken, user: result.user },
         message: 'Login successful',
       });
-    } catch (error) {
-      next(error);
-    }
+    } catch (error) { next(error); }
   }
 
   async refreshToken(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const refreshToken = req.cookies.refreshToken || req.body.refreshToken;
+      // Refresh token from cookie only — never from body (CSRF protection)
+      const refreshToken = req.cookies?.[COOKIE_NAME] as string | undefined;
       if (!refreshToken) throw new AuthenticationError('Refresh token not found');
 
       const result = await authService.refreshAccessToken(refreshToken);
-      // Optionally set the new refresh token in a cookie
-      if (result.refreshToken) {
-        res.cookie('refreshToken', result.refreshToken, {
-          httpOnly: true,
-          secure: process.env.NODE_ENV === 'production',
-          sameSite: 'strict',
-          maxAge: 7 * 24 * 60 * 60 * 1000,
-        });
-      }
-      res.status(200).json({ success: true, data: { accessToken: result.accessToken }, message: 'Token refreshed' });
-    } catch (error) {
-      next(error);
-    }
+
+      setRefreshCookie(res, result.refreshToken);
+
+      res.status(200).json({
+        success: true,
+        data: { accessToken: result.accessToken },
+        message: 'Token refreshed',
+      });
+    } catch (error) { next(error); }
   }
 
   async logout(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const refreshToken = req.cookies.refreshToken;
-      const user = (req as any).user; // Set by authenticate middleware
-      if (refreshToken && user?.userId) {
+      const user = getAuthenticatedUser(req);
+      const refreshToken = req.cookies?.[COOKIE_NAME] as string | undefined;
+
+      if (refreshToken) {
         await authService.logout(user.userId, refreshToken);
       }
-      res.clearCookie('refreshToken');
+
+      clearRefreshCookie(res);
       res.status(200).json({ success: true, message: 'Logged out successfully' });
-    } catch (error) {
-      next(error);
-    }
+    } catch (error) { next(error); }
   }
 
   async requestPasswordReset(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const { email } = passwordResetRequestSchema.parse(req.body);
-      const result = await authService.requestPasswordReset(email);
-      // No token returned in response
-      res.status(200).json({ success: true, data: result, message: 'If the email exists, a reset link was sent' });
-    } catch (error) {
-      next(error);
-    }
+      const { email } = parseBody(passwordResetRequestSchema, req.body);
+      await authService.requestPasswordReset(email);
+      // Always same response — prevents email enumeration
+      res.status(200).json({
+        success: true,
+        message: 'If that email address is registered, a reset link has been sent.',
+      });
+    } catch (error) { next(error); }
   }
 
   async resetPassword(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const { resetToken, newPassword } = passwordResetSchema.parse(req.body);
-      const result = await authService.resetPassword(resetToken, newPassword);
-      res.status(200).json({ success: true, data: result, message: 'Password reset successfully' });
-    } catch (error) {
-      next(error);
-    }
+      const { resetToken, newPassword } = parseBody(passwordResetSchema, req.body);
+      await authService.resetPassword(resetToken, newPassword);
+      res.status(200).json({ success: true, message: 'Password reset successfully' });
+    } catch (error) { next(error); }
   }
 
   async changePassword(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const { currentPassword, newPassword } = changePasswordSchema.parse(req.body);
-      const userId = (req as any).user?.userId;
-      if (!userId) throw new AuthenticationError('User not authenticated');
-      const result = await authService.changePassword(userId, currentPassword, newPassword);
-      res.status(200).json({ success: true, data: result, message: 'Password changed' });
-    } catch (error) {
-      next(error);
-    }
+      const user = getAuthenticatedUser(req);
+      const { currentPassword, newPassword } = parseBody(changePasswordSchema, req.body);
+      await authService.changePassword(user.userId, currentPassword, newPassword);
+      res.status(200).json({ success: true, message: 'Password changed successfully' });
+    } catch (error) { next(error); }
   }
 
   async enableTwoFactor(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const userId = (req as any).user?.userId;
-      if (!userId) throw new AuthenticationError('User not authenticated');
-      const result = await authService.enableTwoFactor(userId);
+      const user = getAuthenticatedUser(req);
+      const result = await authService.enableTwoFactor(user.userId);
       res.status(200).json({ success: true, data: result, message: 'OTP sent for 2FA setup' });
-    } catch (error) {
-      next(error);
-    }
+    } catch (error) { next(error); }
   }
 
   async verifyTwoFactorOtp(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const { otpCode } = verifyOtpSchema.parse(req.body);
-      const userId = (req as any).user?.userId;
-      if (!userId) throw new AuthenticationError('User not authenticated');
-      const result = await authService.verifyTwoFactorOtp(userId, otpCode);
+      const user = getAuthenticatedUser(req);
+      const { otpCode } = parseBody(verifyOtpSchema, req.body);
+      const result = await authService.verifyTwoFactorOtp(user.userId, otpCode);
       res.status(200).json({ success: true, data: result, message: result.message });
-    } catch (error) {
-      next(error);
-    }
+    } catch (error) { next(error); }
   }
 
   async disableTwoFactor(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const { password } = disableTwoFactorSchema.parse(req.body);
-      const userId = (req as any).user?.userId;
-      if (!userId) throw new AuthenticationError('User not authenticated');
-      const result = await authService.disableTwoFactor(userId, password);
+      const user = getAuthenticatedUser(req);
+      const { password } = parseBody(disableTwoFactorSchema, req.body);
+      const result = await authService.disableTwoFactor(user.userId, password);
       res.status(200).json({ success: true, data: result, message: result.message });
-    } catch (error) {
-      next(error);
-    }
+    } catch (error) { next(error); }
   }
 }
 

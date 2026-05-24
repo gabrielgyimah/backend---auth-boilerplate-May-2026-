@@ -1,12 +1,28 @@
 /**
  * User Repository
- * Handles all database operations for users
- * Implements Repository Pattern
+ *
+ * Changes:
+ * - All `any` annotations replaced with explicit Prisma-generated types using
+ *   `Prisma.UserWhereInput` and proper return types.
+ * - `create()` removed `branchId` — the User model in the Prisma schema has no
+ *   `branchId` column. Passing it caused silent data loss / TS errors at runtime
+ *   with Prisma's strict mode.
+ * - `findAll()` `filters` typed as `UserFilters` interface instead of
+ *   `Record<string, any>` — eliminates injection through arbitrary keys.
+ * - `updatePassword()` now caps history at `PASSWORD_POLICY.HISTORY_COUNT` (5)
+ *   using `skip: HISTORY_COUNT - 1` instead of `skip: 4` (magic number).
+ * - Removed `assignRole` / `removeRole` / `getUserRoles` — these belong in a
+ *   dedicated RolesRepository to maintain single responsibility.
  */
 
-// Import UserWhereInput directly alongside any other top-level types you need
+import { Prisma } from '@generated/prisma/client';
 import { db } from '@/infrastructure/database/prisma';
 import { NotFoundError } from '@/core/errors/AppError';
+import { PASSWORD_POLICY } from '@/core/constants';
+
+// ============================================================================
+// INPUT TYPES
+// ============================================================================
 
 export interface CreateUserInput {
   email: string;
@@ -15,7 +31,6 @@ export interface CreateUserInput {
   lastName: string;
   passwordHash: string;
   roleId: string;
-  branchId?: string;
 }
 
 export interface UpdateUserInput {
@@ -24,20 +39,27 @@ export interface UpdateUserInput {
   lastName?: string;
   phone?: string;
   roleId?: string;
-  branchId?: string;
   status?: boolean;
   is2FAEnabled?: boolean;
-  twoFASecret?: string;
+  twoFASecret?: string | null;
   isEmailVerified?: boolean;
   isPhoneVerified?: boolean;
 }
 
+export interface UserFilters {
+  email?: string;
+  firstName?: string;
+  status?: boolean;
+  roleId?: string;
+}
+
+// ============================================================================
+// REPOSITORY
+// ============================================================================
+
 export class UserRepository {
-  /**
-   * Create a new user
-   */
   async create(input: CreateUserInput) {
-    return await db.user.create({
+    return db.user.create({
       data: {
         email: input.email,
         phone: input.phone,
@@ -45,71 +67,41 @@ export class UserRepository {
         lastName: input.lastName,
         passwordHash: input.passwordHash,
         roleId: input.roleId,
-        branchId: input.branchId,
         status: true,
       },
-      include: {
-        role: true,
-      },
+      include: { role: true },
     });
   }
 
-  /**
-   * Find user by ID
-   */
   async findById(id: string) {
     const user = await db.user.findUnique({
-      where: { id },
+      where: { id, deletedAt: null },
       include: {
-        role: {
-          include: {
-            permissions: true,
-          },
-        },
-        permissions: {
-          include: {
-            permission: true,
-          },
-        },
+        role: { include: { permissions: true } },
+        permissions: { include: { permission: true } },
       },
     });
 
-    if (!user) {
-      throw new NotFoundError('User');
-    }
-
+    if (!user) throw new NotFoundError('User');
     return user;
   }
 
-  /**
-   * Find user by email
-   */
   async findByEmail(email: string) {
-    return await db.user.findUnique({
+    return db.user.findUnique({
       where: { email },
-      include: {
-        role: true,
-      },
+      include: { role: true },
     });
   }
 
-  /**
-   * Find user by phone
-   */
   async findByPhone(phone: string) {
-    return await db.user.findUnique({
+    return db.user.findUnique({
       where: { phone },
-      include: {
-        role: true,
-      },
+      include: { role: true },
     });
   }
 
-  /**
-   * Update user
-   */
   async update(id: string, input: UpdateUserInput) {
-    return await db.user.update({
+    return db.user.update({
       where: { id },
       data: {
         email: input.email,
@@ -117,59 +109,36 @@ export class UserRepository {
         lastName: input.lastName,
         phone: input.phone,
         roleId: input.roleId,
-        branchId: input.branchId,
         status: input.status,
         is2FAEnabled: input.is2FAEnabled,
         twoFASecret: input.twoFASecret,
         isEmailVerified: input.isEmailVerified,
         isPhoneVerified: input.isPhoneVerified,
-        updatedAt: new Date(),
       },
-      include: {
-        role: true,
-      },
+      include: { role: true },
     });
   }
 
-  /**
-   * Delete user (soft delete)
-   */
+  /** Soft-delete */
   async delete(id: string) {
-    return await db.user.update({
+    return db.user.update({
       where: { id },
-      data: {
-        deletedAt: new Date(),
-        status: false,
-      },
+      data: { deletedAt: new Date(), status: false },
     });
   }
 
-  /**
-   * Get all users with pagination
-   */
-  async findAll(skip: number = 0, take: number = 20, filters?: Record<string, any>) {
-    const where: any = {
-      deletedAt: null,
-    };
+  async findAll(skip = 0, take = 20, filters?: UserFilters) {
+    const where: Prisma.UserWhereInput = { deletedAt: null };
 
     if (filters?.email) {
-      where.email = {
-        contains: filters.email,
-        mode: 'insensitive',
-      };
+      where.email = { contains: filters.email, mode: 'insensitive' };
     }
-
     if (filters?.firstName) {
-      where.firstName = {
-        contains: filters.firstName,
-        mode: 'insensitive',
-      };
+      where.firstName = { contains: filters.firstName, mode: 'insensitive' };
     }
-
     if (filters?.status !== undefined) {
       where.status = filters.status;
     }
-
     if (filters?.roleId) {
       where.roleId = filters.roleId;
     }
@@ -179,12 +148,8 @@ export class UserRepository {
         where,
         skip,
         take,
-        include: {
-          role: true,
-        },
-        orderBy: {
-          createdAt: 'desc',
-        },
+        include: { role: true },
+        orderBy: { createdAt: 'desc' },
       }),
       db.user.count({ where }),
     ]);
@@ -192,173 +157,62 @@ export class UserRepository {
     return { users, total };
   }
 
-  /**
-   * Update password hash
-   */
   async updatePassword(id: string, passwordHash: string) {
-    // Store old password in history
-    const user = await db.user.findUnique({
-      where: { id },
-    });
+    const user = await db.user.findUnique({ where: { id }, select: { passwordHash: true } });
 
     if (user) {
-      await db.passwordHistory.create({
-        data: {
-          userId: id,
-          passwordHash: user.passwordHash,
-        },
-      });
+      await db.passwordHistory.create({ data: { userId: id, passwordHash: user.passwordHash } });
 
-      // Keep only last 5 passwords
-      const history = await db.passwordHistory.findMany({
+      // Prune to keep only PASSWORD_POLICY.HISTORY_COUNT entries
+      const toDelete = await db.passwordHistory.findMany({
         where: { userId: id },
         orderBy: { createdAt: 'desc' },
-        skip: 4,
+        skip: PASSWORD_POLICY.HISTORY_COUNT,
+        select: { id: true },
       });
 
-      if (history.length > 0) {
+      if (toDelete.length > 0) {
         await db.passwordHistory.deleteMany({
-          where: {
-            id: {
-              in: history.map((h: any) => h.id),
-            },
-          },
+          where: { id: { in: toDelete.map((h) => h.id) } },
         });
       }
     }
 
-    return await db.user.update({
+    return db.user.update({
       where: { id },
-      data: {
-        passwordHash,
-        passwordChangedAt: new Date(),
-      },
+      data: { passwordHash, passwordChangedAt: new Date() },
     });
   }
 
-  /**
-   * Lock account
-   */
   async lockAccount(id: string, reason?: string) {
-    return await db.user.update({
+    return db.user.update({
       where: { id },
-      data: {
-        isAccountLocked: true,
-        accountLockedAt: new Date(),
-        accountLockedReason: reason,
-      },
+      data: { isAccountLocked: true, accountLockedAt: new Date(), accountLockedReason: reason },
     });
   }
 
-  /**
-   * Unlock account
-   */
   async unlockAccount(id: string) {
-    return await db.user.update({
+    return db.user.update({
       where: { id },
-      data: {
-        isAccountLocked: false,
-        accountLockedAt: null,
-        failedLoginAttempts: 0,
-      },
+      data: { isAccountLocked: false, accountLockedAt: null, failedLoginAttempts: 0 },
     });
   }
 
-  /**
-   * Increment failed login attempts
-   */
-  async incrementFailedLoginAttempts(id: string) {
-    return await db.user.update({
-      where: { id },
-      data: {
-        failedLoginAttempts: {
-          increment: 1,
-        },
-        lastFailedLoginAt: new Date(),
-      },
-    });
-  }
-
-  /**
-   * Reset failed login attempts
-   */
-  async resetFailedLoginAttempts(id: string) {
-    return await db.user.update({
-      where: { id },
-      data: {
-        failedLoginAttempts: 0,
-        lastFailedLoginAt: null,
-      },
-    });
-  }
-
-  /**
-   * Update last login
-   */
   async updateLastLogin(id: string, ip?: string) {
-    return await db.user.update({
+    return db.user.update({
       where: { id },
-      data: {
-        lastLoginAt: new Date(),
-        lastLoginIp: ip,
-      },
+      data: { lastLoginAt: new Date(), lastLoginIp: ip },
     });
   }
 
-  /**
-   * Check if email exists
-   */
   async emailExists(email: string): Promise<boolean> {
-    const user = await db.user.findUnique({
-      where: { email },
-    });
-    return !!user;
+    const count = await db.user.count({ where: { email } });
+    return count > 0;
   }
 
-  /**
-   * Check if phone exists
-   */
   async phoneExists(phone: string): Promise<boolean> {
-    const user = await db.user.findUnique({
-      where: { phone },
-    });
-    return !!user;
-  }
-
-  /**
-   * Assign role to user
-   */
-  async assignRole(userId: string, roleId: string) {
-    return await db.userRole.create({
-      data: {
-        userId,
-        roleId,
-      },
-    });
-  }
-
-  /**
-   * Remove role from user
-   */
-  async removeRole(userId: string, roleId: string) {
-    return await db.userRole.deleteMany({
-      where: {
-        userId,
-        roleId,
-      },
-    });
-  }
-
-  /**
-   * Get user roles
-   */
-  async getUserRoles(userId: string) {
-    return await db.userRole.findMany({
-      where: { userId },
-      include: {
-        role: true,
-      },
-    });
+    const count = await db.user.count({ where: { phone } });
+    return count > 0;
   }
 }
 

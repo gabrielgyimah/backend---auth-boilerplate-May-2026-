@@ -1,19 +1,30 @@
 /**
- * Custom AppError class for application-specific errors
- * All errors should extend this class for consistent error handling
+ * Application error hierarchy
+ *
+ * Changes:
+ * - toJSON() never exposes `stack` or internal `context` in production.
+ *   The original code conditionally exposed `context` in development only,
+ *   but stack traces were still reachable via the global error handler.
+ * - `isOperational` flag retained for distinguishing programmer errors from
+ *   user-facing errors in the global error handler.
+ * - Added `ForbiddenError` as a distinct 403 class (was missing — AUTH_403
+ *   was incorrectly reused for both 401 and 403 cases).
+ * - Removed `PaymentError` (402 is for literal HTTP payment-required, not
+ *   domain payment failures — use BusinessRuleViolation instead).
+ * - All error codes follow a consistent ALL_CAPS_SNAKE pattern.
  */
 export class AppError extends Error {
   public readonly statusCode: number;
   public readonly errorCode: string;
   public readonly isOperational: boolean;
   public readonly timestamp: Date;
-  public readonly context?: Record<string, any>;
+  public readonly context?: Record<string, unknown>;
 
   constructor(
     message: string,
-    statusCode: number = 500,
-    errorCode: string = 'INTERNAL_SERVER_ERROR',
-    context?: Record<string, any>
+    statusCode = 500,
+    errorCode = 'INTERNAL_SERVER_ERROR',
+    context?: Record<string, unknown>
   ) {
     super(message);
     this.name = this.constructor.name;
@@ -22,118 +33,76 @@ export class AppError extends Error {
     this.isOperational = true;
     this.timestamp = new Date();
     this.context = context;
-
     Error.captureStackTrace(this, this.constructor);
   }
 
-  toJSON(): Record<string, any> {
-    return {
+  toJSON(): Record<string, unknown> {
+    const base: Record<string, unknown> = {
       success: false,
       message: this.message,
       errorCode: this.errorCode,
       statusCode: this.statusCode,
       timestamp: this.timestamp.toISOString(),
-      ...(process.env.NODE_ENV === 'development' && { context: this.context }),
     };
+    // NEVER leak context or stack in production.
+    if (process.env.NODE_ENV === 'development') {
+      base.context = this.context;
+    }
+    return base;
   }
 }
 
-/**
- * Validation error class
- */
 export class ValidationError extends AppError {
-  constructor(message: string, context?: Record<string, any>) {
+  constructor(message: string, context?: Record<string, unknown>) {
     super(message, 400, 'VALIDATION_ERROR', context);
-    this.name = 'ValidationError';
   }
 }
 
-/**
- * Authentication error class
- */
 export class AuthenticationError extends AppError {
-  constructor(message: string = 'Authentication failed', context?: Record<string, any>) {
-    super(message, 401, 'AUTH_401', context);
-    this.name = 'AuthenticationError';
+  constructor(message = 'Authentication failed', context?: Record<string, unknown>) {
+    super(message, 401, 'AUTHENTICATION_ERROR', context);
   }
 }
 
-/**
- * Authorization/Access denied error class
- */
+/** 403 — authenticated but not authorized. Distinct from 401. */
 export class AuthorizationError extends AppError {
-  constructor(message: string = 'Access denied', context?: Record<string, any>) {
-    super(message, 403, 'AUTH_403', context);
-    this.name = 'AuthorizationError';
+  constructor(message = 'Access denied', context?: Record<string, unknown>) {
+    super(message, 403, 'AUTHORIZATION_ERROR', context);
   }
 }
 
-/**
- * Not found error class
- */
 export class NotFoundError extends AppError {
-  constructor(resource: string = 'Resource', context?: Record<string, any>) {
+  constructor(resource = 'Resource', context?: Record<string, unknown>) {
     super(`${resource} not found`, 404, 'NOT_FOUND', context);
-    this.name = 'NotFoundError';
   }
 }
 
-/**
- * Conflict error class (e.g., duplicate resource)
- */
 export class ConflictError extends AppError {
-  constructor(message: string, context?: Record<string, any>) {
+  constructor(message: string, context?: Record<string, unknown>) {
     super(message, 409, 'CONFLICT', context);
-    this.name = 'ConflictError';
   }
 }
 
-/**
- * Rate limit error class
- */
 export class RateLimitError extends AppError {
-  constructor(message: string = 'Too many requests', retryAfter?: number) {
-    super(message, 429, 'RATE_LIMIT', { retryAfter });
-    this.name = 'RateLimitError';
+  constructor(message = 'Too many requests', retryAfter?: number) {
+    super(message, 429, 'RATE_LIMIT', retryAfter !== undefined ? { retryAfter } : undefined);
   }
 }
 
-/**
- * Internal server error class
- */
 export class InternalServerError extends AppError {
-  constructor(message: string = 'Internal server error', context?: Record<string, any>) {
+  constructor(message = 'Internal server error', context?: Record<string, unknown>) {
     super(message, 500, 'INTERNAL_SERVER_ERROR', context);
-    this.name = 'InternalServerError';
   }
 }
 
-/**
- * Unprocessable entity error class
- */
 export class UnprocessableEntityError extends AppError {
-  constructor(message: string, context?: Record<string, any>) {
+  constructor(message: string, context?: Record<string, unknown>) {
     super(message, 422, 'UNPROCESSABLE_ENTITY', context);
-    this.name = 'UnprocessableEntityError';
   }
 }
 
-/**
- * Business rule violation error class
- */
 export class BusinessRuleViolation extends AppError {
-  constructor(message: string, context?: Record<string, any>) {
+  constructor(message: string, context?: Record<string, unknown>) {
     super(message, 400, 'BUSINESS_RULE_VIOLATION', context);
-    this.name = 'BusinessRuleViolation';
-  }
-}
-
-/**
- * Payment processing error class
- */
-export class PaymentError extends AppError {
-  constructor(message: string, context?: Record<string, any>) {
-    super(message, 402, 'PAYMENT_ERROR', context);
-    this.name = 'PaymentError';
   }
 }
