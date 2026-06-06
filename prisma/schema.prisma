@@ -12,6 +12,7 @@ datasource db {
   provider = "postgresql"
 }
 
+
 // ============================================================================
 // ENUMS - Define all enumerated types for the banking system
 // ============================================================================

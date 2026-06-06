@@ -15,6 +15,9 @@ import { config } from '@/config';
 import logger, { logRequest } from '@/infrastructure/database/logger';
 import { AppError } from '@/core/errors/AppError';
 import { RATE_LIMIT } from '@/core/constants';
+import authRoutes from '@/modules/auth/routes';
+import userRoutes from '@/modules/users/routes';
+import { AccessTokenPayload } from './core/utils';
 
 // ============================================================================
 // APPLICATION SETUP
@@ -129,8 +132,8 @@ export function createApp(): Express {
   // =========================================================================
   // MODULE ROUTES - Users, Customers, Accounts, Transactions, Auth, etc. (to be added)
   // =========================================================================
-  app.use('/api/v1/auth', require('@/modules/auth/routes').default);
-  app.use('/api/v1/users', require('@/modules/users/routes').default);
+  app.use('/api/v1/auth', authRoutes);
+  app.use('/api/v1/users', userRoutes);
 
 
   // =========================================================================
@@ -189,7 +192,7 @@ declare global {
   namespace Express {
     interface Request {
       id?: string;
-      user?: any;
+      user?: AccessTokenPayload;
     }
   }
 }

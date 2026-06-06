@@ -24,8 +24,8 @@ const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'staging', 'production']).default('development'),
   PORT: z.coerce.number().default(3000),
   HOST: z.string().default('0.0.0.0'),
-  API_URL: z.string().url().default('http://localhost:3000'),
-  FRONTEND_URL: z.string().url().default('http://localhost:3000'),
+  API_URL: z.string().url().default(`http://localhost:${process.env.PORT || 3005}`),
+  FRONTEND_URL: z.string().url().default(`http://localhost:${process.env.FRONTEND_PORT || 3000}`),
 
   // Database
   DATABASE_URL: z.string().url(),

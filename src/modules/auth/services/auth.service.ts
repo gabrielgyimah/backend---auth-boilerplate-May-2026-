@@ -68,6 +68,7 @@ import {
   type AccessTokenPayload,
   type RefreshTokenPayload,
 } from '@/core/utils';
+import { EmailService } from '@/infrastructure/email';
 import {
   AuthenticationError,
   ConflictError,
@@ -283,10 +284,15 @@ export class AuthService {
       verificationExpiry
     );
 
-    // TODO: await emailService.sendVerificationEmail(user.email, verificationToken);
+    // Send verification email
+    void EmailService.sendVerificationEmail(
+      user.email,
+      user.firstName,
+      verificationToken
+    );
 
     void recordSecurityEvent(user.id, SecurityEventType.REGISTER, {
-      description: 'User registered — verification email queued',
+      description: 'User registered — verification email sent',
       severity: 'LOW',
     });
 
@@ -309,7 +315,12 @@ export class AuthService {
     if (!record) throw new ValidationError('Invalid or expired verification token');
 
     await authRepository.markEmailVerificationTokenAsUsed(tokenHash);
-    await authRepository.verifyUserEmail(record.userId);
+    const user = await authRepository.verifyUserEmail(record.userId);
+
+    // Send verification success notification
+    if (user) {
+      void EmailService.sendEmailVerifiedNotification(user.email, user.firstName);
+    }
 
     void recordSecurityEvent(record.userId, SecurityEventType.EMAIL_VERIFIED, {
       description: 'Email verified successfully',
@@ -398,7 +409,7 @@ export class AuthService {
       const otp = generateOTP(SECURITY.OTP_LENGTH);
       const otpHash = hashOtp(otp);
       const otpExpiry = new Date(Date.now() + expiryToMs(TOKEN_EXPIRY.OTP_TOKEN));
-
+      
       const otpRequest = await authRepository.createOtpRequest(
         user.id,
         otpHash,          // store HMAC, not plaintext
@@ -407,7 +418,8 @@ export class AuthService {
         user.email
       );
 
-      // TODO: await emailService.sendOtpEmail(user.email, otp); // send plaintext to user
+      // Send OTP via email
+      void EmailService.sendLoginOtp(user.email, user.firstName, otp);
 
       const challengeToken = signChallengeToken({
         userId: user.id,
@@ -542,6 +554,14 @@ export class AuthService {
       device.id
     );
 
+    // Send login notification
+    void EmailService.sendLoginNotification(user.email, user.firstName, {
+      name: deviceName,
+      type: deviceType,
+      ipAddress,
+      userAgent,
+    });
+
     void recordSecurityEvent(userId, SecurityEventType.LOGIN_SUCCESS, {
       description: `2FA verified, device trusted=${trustDevice}`,
       ipAddress, userAgent, deviceId: device.id, severity: 'LOW',
@@ -645,7 +665,8 @@ export class AuthService {
 
     await authRepository.createPasswordResetToken(user.id, resetTokenHash, expiresAt);
 
-    // TODO: await emailService.sendPasswordResetEmail(email, resetToken);
+    // Send password reset email
+    void EmailService.sendPasswordResetEmail(user.email, user.firstName, resetToken);
 
     void recordSecurityEvent(user.id, SecurityEventType.PASSWORD_RESET, {
       description: 'Password reset requested',
@@ -672,7 +693,7 @@ export class AuthService {
       Date.now() + PASSWORD_POLICY.EXPIRE_DAYS * 86_400_000
     );
 
-    await db.user.update({
+    const user = await db.user.update({
       where: { id: record.userId },
       data: {
         passwordHash: newPasswordHash,
@@ -687,6 +708,9 @@ export class AuthService {
 
     await authRepository.markResetTokenAsUsed(tokenHash);
     await savePasswordHistory(record.userId, newPasswordHash);
+
+    // Send password changed notification
+    void EmailService.sendPasswordChangedNotification(user.email, user.firstName);
 
     void recordSecurityEvent(record.userId, SecurityEventType.PASSWORD_RESET, {
       description: 'Password reset completed',
@@ -719,12 +743,15 @@ export class AuthService {
       Date.now() + PASSWORD_POLICY.EXPIRE_DAYS * 86_400_000
     );
 
-    await db.user.update({
+    const updatedUser = await db.user.update({
       where: { id: userId },
       data: { passwordHash: newHash, passwordChangedAt: new Date(), passwordExpiresAt },
     });
 
     await savePasswordHistory(userId, newHash);
+
+    // Send password changed notification
+    void EmailService.sendPasswordChangedNotification(updatedUser.email, updatedUser.firstName);
 
     void recordSecurityEvent(userId, SecurityEventType.PASSWORD_CHANGE, {
       description: 'Password changed by user',
@@ -755,7 +782,8 @@ export class AuthService {
       user.email
     );
 
-    // TODO: await emailService.sendOtpEmail(user.email, otp);
+    // Send OTP via email
+    void EmailService.sendLoginOtp(user.email, user.firstName, otp);
     return { success: true, otpRequired: true, message: 'OTP sent to email' };
   }
 
@@ -774,7 +802,14 @@ export class AuthService {
     }
 
     await authRepository.verifyOtpRequest(otpRequest.id);
-    await db.user.update({ where: { id: userId }, data: { is2FAEnabled: true } });
+    const updatedUser = await db.user.update({ 
+      where: { id: userId }, 
+      data: { is2FAEnabled: true },
+      include: { role: true }
+    });
+
+    // Send 2FA enabled notification
+    void EmailService.sendTwoFactorEnabledNotification(updatedUser.email, updatedUser.firstName);
 
     void recordSecurityEvent(userId, SecurityEventType.MFA_ENABLED, {
       description: '2FA enabled',
