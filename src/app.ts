@@ -17,6 +17,7 @@ import { AppError } from '@/core/errors/AppError';
 import { RATE_LIMIT } from '@/core/constants';
 import authRoutes from '@/modules/auth/routes';
 import userRoutes from '@/modules/users/routes';
+import webhookRoutes from '@/modules/webhooks/routes';
 import { AccessTokenPayload } from './core/utils';
 
 // ============================================================================
@@ -134,6 +135,7 @@ export function createApp(): Express {
   // =========================================================================
   app.use('/api/v1/auth', authRoutes);
   app.use('/api/v1/users', userRoutes);
+  app.use('/api/v1/webhooks', webhookRoutes);
 
 
   // =========================================================================
@@ -173,7 +175,7 @@ export function createApp(): Express {
     }
 
     // Generic error response
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: 'Internal server error',
       errorCode: 'INTERNAL_SERVER_ERROR',

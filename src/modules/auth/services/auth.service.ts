@@ -68,7 +68,7 @@ import {
   type AccessTokenPayload,
   type RefreshTokenPayload,
 } from '@/core/utils';
-import { EmailService } from '@/infrastructure/email';
+import EmailQueueManager from '@/infrastructure/email/email-queue.manager';
 import {
   AuthenticationError,
   ConflictError,
@@ -284,11 +284,12 @@ export class AuthService {
       verificationExpiry
     );
 
-    // Send verification email
-    void EmailService.sendVerificationEmail(
+    // Queue verification email (async, non-blocking)
+    void EmailQueueManager.queueVerificationEmail(
       user.email,
       user.firstName,
-      verificationToken
+      `${process.env.FRONTEND_URL || 'http://localhost:3000'}/auth/verify-email?token=${verificationToken}`,
+      user.id
     );
 
     void recordSecurityEvent(user.id, SecurityEventType.REGISTER, {
@@ -317,9 +318,9 @@ export class AuthService {
     await authRepository.markEmailVerificationTokenAsUsed(tokenHash);
     const user = await authRepository.verifyUserEmail(record.userId);
 
-    // Send verification success notification
+    // Queue email verified notification
     if (user) {
-      void EmailService.sendEmailVerifiedNotification(user.email, user.firstName);
+      void EmailQueueManager.queueEmailVerifiedNotification(user.email, user.firstName, record.userId);
     }
 
     void recordSecurityEvent(record.userId, SecurityEventType.EMAIL_VERIFIED, {
@@ -409,7 +410,7 @@ export class AuthService {
       const otp = generateOTP(SECURITY.OTP_LENGTH);
       const otpHash = hashOtp(otp);
       const otpExpiry = new Date(Date.now() + expiryToMs(TOKEN_EXPIRY.OTP_TOKEN));
-      
+
       const otpRequest = await authRepository.createOtpRequest(
         user.id,
         otpHash,          // store HMAC, not plaintext
@@ -418,8 +419,8 @@ export class AuthService {
         user.email
       );
 
-      // Send OTP via email
-      void EmailService.sendLoginOtp(user.email, user.firstName, otp);
+      // Queue OTP email (high priority, time-sensitive)
+      void EmailQueueManager.queueLoginOtp(user.email, user.firstName, otp, user.id);
 
       const challengeToken = signChallengeToken({
         userId: user.id,
@@ -554,13 +555,13 @@ export class AuthService {
       device.id
     );
 
-    // Send login notification
-    void EmailService.sendLoginNotification(user.email, user.firstName, {
+    // Queue login notification
+    void EmailQueueManager.queueLoginNotification(user.email, user.firstName, {
       name: deviceName,
       type: deviceType,
       ipAddress,
       userAgent,
-    });
+    }, userId);
 
     void recordSecurityEvent(userId, SecurityEventType.LOGIN_SUCCESS, {
       description: `2FA verified, device trusted=${trustDevice}`,
@@ -665,8 +666,13 @@ export class AuthService {
 
     await authRepository.createPasswordResetToken(user.id, resetTokenHash, expiresAt);
 
-    // Send password reset email
-    void EmailService.sendPasswordResetEmail(user.email, user.firstName, resetToken);
+    // Queue password reset email
+    void EmailQueueManager.queuePasswordResetEmail(
+      user.email,
+      user.firstName,
+      `${process.env.FRONTEND_URL || 'http://localhost:3000'}/auth/reset-password?token=${resetToken}`,
+      user.id
+    );
 
     void recordSecurityEvent(user.id, SecurityEventType.PASSWORD_RESET, {
       description: 'Password reset requested',
@@ -709,8 +715,8 @@ export class AuthService {
     await authRepository.markResetTokenAsUsed(tokenHash);
     await savePasswordHistory(record.userId, newPasswordHash);
 
-    // Send password changed notification
-    void EmailService.sendPasswordChangedNotification(user.email, user.firstName);
+    // Queue password changed notification
+    void EmailQueueManager.queuePasswordChangedNotification(user.email, user.firstName, record.userId);
 
     void recordSecurityEvent(record.userId, SecurityEventType.PASSWORD_RESET, {
       description: 'Password reset completed',
@@ -750,8 +756,8 @@ export class AuthService {
 
     await savePasswordHistory(userId, newHash);
 
-    // Send password changed notification
-    void EmailService.sendPasswordChangedNotification(updatedUser.email, updatedUser.firstName);
+    // Queue password changed notification
+    void EmailQueueManager.queuePasswordChangedNotification(updatedUser.email, updatedUser.firstName, userId);
 
     void recordSecurityEvent(userId, SecurityEventType.PASSWORD_CHANGE, {
       description: 'Password changed by user',
@@ -782,8 +788,8 @@ export class AuthService {
       user.email
     );
 
-    // Send OTP via email
-    void EmailService.sendLoginOtp(user.email, user.firstName, otp);
+    // Queue OTP email
+    void EmailQueueManager.queueLoginOtp(user.email, user.firstName, otp, user.id);
     return { success: true, otpRequired: true, message: 'OTP sent to email' };
   }
 
@@ -808,8 +814,8 @@ export class AuthService {
       include: { role: true }
     });
 
-    // Send 2FA enabled notification
-    void EmailService.sendTwoFactorEnabledNotification(updatedUser.email, updatedUser.firstName);
+    // Queue 2FA enabled notification
+    void EmailQueueManager.queueTwoFactorEnabledNotification(updatedUser.email, updatedUser.firstName, userId);
 
     void recordSecurityEvent(userId, SecurityEventType.MFA_ENABLED, {
       description: '2FA enabled',

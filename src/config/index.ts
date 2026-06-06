@@ -80,13 +80,35 @@ const envSchema = z.object({
   REDIS_DB: z.coerce.number().default(0),
   REDIS_CACHE_TTL: z.coerce.number().default(3600),
 
-  // Email (SMTP)
+  // Cloud Redis
+  CLOUD_REDIS_HOST: z.string().optional(),
+  CLOUD_REDIS_PORT: z.coerce.number().optional(),
+  CLOUD_REDIS_USERNAME: z.string().optional(),
+  CLOUD_REDIS_PASSWORD: z.string().optional(),
+  CLOUD_REDIS_DB: z.coerce.number().optional(),
+  CLOUD_REDIS_CACHE_TTL: z.coerce.number().default(3600),
+
+  // Email (SMTP - legacy, use SendGrid instead)
   SMTP_HOST: z.string().optional(),
   SMTP_PORT: z.coerce.number().default(587),
   SMTP_USER: z.string().optional(),
   SMTP_PASSWORD: z.string().optional(),
   SMTP_FROM: z.string().email().optional(),
   SMTP_FROM_NAME: z.string().optional(),
+
+  // SendGrid Configuration
+  SENDGRID_API_KEY: z.string().optional(),
+  SENDGRID_WEBHOOK_KEY: z.string().optional(),
+  SENDGRID_TEMPLATE_VERIFICATION: z.string().optional(),
+  SENDGRID_TEMPLATE_EMAIL_VERIFIED: z.string().optional(),
+  SENDGRID_TEMPLATE_LOGIN_OTP: z.string().optional(),
+  SENDGRID_TEMPLATE_PASSWORD_RESET: z.string().optional(),
+  SENDGRID_TEMPLATE_PASSWORD_CHANGED: z.string().optional(),
+  SENDGRID_TEMPLATE_2FA_ENABLED: z.string().optional(),
+  SENDGRID_TEMPLATE_LOGIN_NOTIFICATION: z.string().optional(),
+  SENDGRID_TEMPLATE_ACCOUNT_LOCKED: z.string().optional(),
+  SENDGRID_TEMPLATE_ACCOUNT_UNLOCKED: z.string().optional(),
+  SENDGRID_TEMPLATE_SUSPICIOUS_ACTIVITY: z.string().optional(),
 
   // Logging
   LOG_LEVEL: z

@@ -7,6 +7,7 @@ import { config } from '@/config';
 import { createApp } from '@/app';
 import { db } from '@/infrastructure/database/prisma';
 import logger from '@/infrastructure/database/logger';
+import { getEmailWorker } from '@/infrastructure/queue/email.worker';
 
 const PORT = config.PORT;
 const HOST = config.HOST;
@@ -20,6 +21,12 @@ async function start(): Promise<void> {
     logger.info('Testing database connection...');
     await db.$queryRaw`SELECT 1`;
     logger.info('Database connection successful');
+
+    // Initialize email worker for async email processing
+    logger.info('Initializing email worker...');
+    const emailWorker = getEmailWorker();
+    await emailWorker.start();
+    logger.info('Email worker started successfully');
 
     // Start server
     const server = app.listen(PORT, HOST, () => {
@@ -38,6 +45,14 @@ async function start(): Promise<void> {
 
       server.close(async () => {
         logger.info('HTTP server closed');
+
+        // Stop email worker
+        try {
+          await emailWorker.stop();
+          logger.info('Email worker stopped');
+        } catch (error) {
+          logger.error('Error stopping email worker:', error);
+        }
 
         // Disconnect database
         await db.$disconnect();

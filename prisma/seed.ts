@@ -327,7 +327,7 @@ async function seedSystemUsers(): Promise<void> {
   // Create super admin
   await db.user.create({
     data: {
-      email: 'superadmin@banking.local',
+      email: 'gabrielsocialshortcuts@gmail.com',
       phone: '+1-212-555-1001',
       firstName: 'Super',
       lastName: 'Admin',

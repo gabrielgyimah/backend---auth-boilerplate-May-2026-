@@ -179,6 +179,8 @@ model User {
   is2FAEnabled           Boolean                  @default(false)
   twoFASecret            String?
   isAccountLocked        Boolean                  @default(false)
+  isEmailInvalid         Boolean                  @default(false)
+  isUnsubscribed         Boolean                  @default(false)
   accountLockedAt        DateTime?
   accountLockedReason    String?
   failedLoginAttempts    Int                      @default(0)
@@ -200,6 +202,7 @@ model User {
   auditLogs              AuditLog[]               @relation("AuditCreator")
   updatedAuditLogs       AuditLog[]               @relation("AuditUpdater")
   securityEvents         SecurityEvent[]
+  emailLogs              EmailLog[]               // Email delivery logs
   createdAt              DateTime                 @default(now())
   updatedAt              DateTime                 @updatedAt
   deletedAt              DateTime?
@@ -658,4 +661,93 @@ model SystemSetting {
   updatedAt   DateTime @updatedAt
 
   @@index([key])
+}
+
+// ============================================================================
+// EMAIL INFRASTRUCTURE
+// ============================================================================
+
+/// Email delivery log
+enum EmailStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  FAILED
+  BOUNCED
+  COMPLAINED
+  UNSUBSCRIBED
+}
+
+/// Email event type (aligns with EmailTemplateType)
+enum EmailEventType {
+  VERIFICATION
+  EMAIL_VERIFIED
+  LOGIN_OTP
+  PASSWORD_RESET
+  PASSWORD_CHANGED
+  TWO_FACTOR_ENABLED
+  LOGIN_NOTIFICATION
+  ACCOUNT_LOCKED
+  ACCOUNT_UNLOCKED
+  SUSPICIOUS_ACTIVITY
+}
+
+/// Email delivery log - tracks all sent emails
+model EmailLog {
+  id              String        @id @default(cuid())
+  uuid            String        @unique @default(cuid())
+  userId          String
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  recipient       String        // Email address
+  subject         String
+  messageId       String?       // SendGrid message ID
+  eventType       EmailEventType
+  status          EmailStatus   @default(QUEUED)
+  sentAt          DateTime?
+  deliveredAt     DateTime?
+  failureReason   String?       // Error message if failed
+  bounceType      String?       // "permanent" or "temporary"
+  complained      Boolean       @default(false)
+  unsubscribed    Boolean       @default(false)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([userId])
+  @@index([recipient])
+  @@index([status])
+  @@index([eventType])
+  @@index([messageId])
+  @@index([createdAt])
+}
+
+/// Email bounce tracking - permanent or temporary bounces
+model EmailBounce {
+  id            String   @id @default(cuid())
+  uuid          String   @unique @default(cuid())
+  email         String   @unique
+  bounceType    String   // "permanent" or "temporary"
+  bounceSubtype String?  // e.g., "general", "mailbox_full", "message_expired"
+  reason        String?
+  occurredAt    DateTime
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([email])
+  @@index([bounceType])
+  @@index([occurredAt])
+}
+
+/// Email complaint tracking - spam complaints
+model EmailComplaint {
+  id            String   @id @default(cuid())
+  uuid          String   @unique @default(cuid())
+  email         String
+  complaintType String?  // "abuse", "fraud", "other"
+  reason        String?
+  occurredAt    DateTime
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([email])
+  @@index([occurredAt])
 }
