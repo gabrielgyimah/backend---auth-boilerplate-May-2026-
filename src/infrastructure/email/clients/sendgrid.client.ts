@@ -142,7 +142,6 @@ export class SendGridEmailClient {
         success: true,
       };
     } catch (error) {
-        console.log('Error body:', error.response?.body); // REMOVE THIS LINE AFTER DEBUGGING
 
       const errorMessage = error instanceof Error ? error.message : String(error);
 
