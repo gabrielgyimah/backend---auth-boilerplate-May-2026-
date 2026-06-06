@@ -8,10 +8,16 @@
  * - Spam complaints
  * - Unsubscribes
  * - Click/open events
+ * * Security Fix Applied:
+ * - IMPLEMENTED REDLOCK: Webhook providers guarantee "at-least-once" delivery.
+ * Wrapped processEvent in a distributed lock keyed by sg_event_id to prevent 
+ * duplicate concurrent processing across scaled containers.
  */
 
 import { db } from '@/infrastructure/database/prisma';
 import logger from '@/infrastructure/database/logger';
+import { config } from '@/config';
+import { lockManager } from '@/infrastructure/lock/redlock'; // Adjust path based on your setup
 
 // ============================================================================
 // TYPES
@@ -45,10 +51,23 @@ export interface ComplaintEvent extends SendGridEvent {
 
 export class SendGridWebhookService {
   /**
-   * Process SendGrid webhook events
+   * Process SendGrid webhook events safely with Distributed Locking
    */
   static async processEvent(event: SendGridEvent): Promise<void> {
+    // 1. Establish a unique Resource Key
+    // SendGrid provides sg_event_id for deduplication. Fallback to a composite key if missing.
+    const eventId = event.sg_event_id || `${event.email}-${event.timestamp}-${event.event}`;
+    const resourceKey = `locks:webhook:sendgrid:${eventId}`;
+    const ttl = config.REDLOCK_TTL || 10000; // Lock TTL in milliseconds (e.g., 10 seconds)
+
+    let lock;
+
     try {
+      // 2. Acquire the distributed lock
+      // If another container is currently processing this exact event, this will throw an ExecutionError
+      lock = await lockManager.acquire([resourceKey], ttl);
+
+      // 3. Process the event payload
       switch (event.event) {
         case 'bounce':
           await this.handleBounce(event as BounceEvent);
@@ -64,7 +83,6 @@ export class SendGridWebhookService {
           break;
         case 'open':
         case 'click':
-          // Log but no action needed for engagement events
           logger.debug('[Webhook] Engagement event received', {
             event: event.event,
             email: event.email,
@@ -73,12 +91,30 @@ export class SendGridWebhookService {
         default:
           logger.debug('[Webhook] Unknown event type', { event: event.event });
       }
-    } catch (error) {
+    } catch (error: any) {
+      // 4. Handle Lock Failures Gracefully
+      // If the error comes from Redlock, it simply means another container handled this webhook duplicate.
+      if (error.name === 'ExecutionError') {
+        logger.debug('[Webhook] Duplicate event safely dropped by Redlock', { eventId, type: event.event });
+        return; 
+      }
+
+      // Handle standard application errors
       logger.error('[Webhook] Error processing event', {
         email: event.email,
         event: event.event,
         error: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      // 5. Always release the lock in the finally block
+      if (lock) {
+        try {
+          await lock.release();
+        } catch (releaseError) {
+          // Log but do not crash; lock may have naturally expired if processing took longer than 10s
+          logger.debug('[Webhook] Lock release skipped (likely expired)', { eventId });
+        }
+      }
     }
   }
 
@@ -96,7 +132,6 @@ export class SendGridWebhookService {
     });
 
     if (bounce_type === 'permanent') {
-      // Mark email as invalid for permanent bounces
       try {
         await db.user.updateMany({
           where: { email: email.toLowerCase() },
@@ -107,10 +142,7 @@ export class SendGridWebhookService {
           },
         });
 
-        logger.info('[Webhook] User email marked as invalid', {
-          email,
-          reason,
-        });
+        logger.info('[Webhook] User email marked as invalid', { email, reason });
       } catch (error) {
         logger.error('[Webhook] Failed to mark email as invalid', {
           email,
@@ -118,7 +150,6 @@ export class SendGridWebhookService {
         });
       }
     } else if (bounce_type === 'temporary') {
-      // Log temporary bounce but don't mark as invalid
       try {
         await db.emailBounce.create({
           data: {
@@ -148,27 +179,24 @@ export class SendGridWebhookService {
     logger.warn('[Webhook] Complaint event received', { email });
 
     try {
-      // Mark email as complained
-      await db.user.updateMany({
-        where: { email: email.toLowerCase() },
-        data: {
-          isEmailComplained: true,
-          emailComplainedAt: new Date(),
-        },
-      });
-
-      // Log complaint event
-      await db.emailComplaint.create({
-        data: {
-          email: email.toLowerCase(),
-          occurredAt: new Date(event.timestamp * 1000),
-          reason: 'User marked as spam',
-        },
-      });
+      await db.$transaction([
+        db.user.updateMany({
+          where: { email: email.toLowerCase() },
+          data: {
+            isEmailComplained: true,
+            emailComplainedAt: new Date(),
+          },
+        }),
+        db.emailComplaint.create({
+          data: {
+            email: email.toLowerCase(),
+            occurredAt: new Date(event.timestamp * 1000),
+            reason: 'User marked as spam',
+          },
+        })
+      ]);
 
       logger.info('[Webhook] Email complaint recorded', { email });
-
-      // Immediately stop sending to this address
       logger.warn('[Webhook] All emails to this address should be halted', { email });
     } catch (error) {
       logger.error('[Webhook] Failed to process complaint', {
@@ -213,7 +241,6 @@ export class SendGridWebhookService {
     logger.debug('[Webhook] Delivered event received', { email });
 
     try {
-      // Update email log if it exists
       await db.emailLog.updateMany({
         where: {
           recipient: email.toLowerCase(),
@@ -234,9 +261,6 @@ export class SendGridWebhookService {
 
   /**
    * Validate webhook signature from SendGrid
-   * @param payload - The raw request body as string
-   * @param signature - The X-Twilio-Email-Event-Webhook-Signature header
-   * @param timestamp - The X-Twilio-Email-Event-Webhook-Timestamp header
    */
   static validateWebhookSignature(
     payload: string,

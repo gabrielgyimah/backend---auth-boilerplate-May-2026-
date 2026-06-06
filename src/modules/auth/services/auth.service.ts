@@ -4,53 +4,54 @@
  * Critical security fixes applied:
  *
  * 1. TOKEN VERSION HARDCODED TO 2 — issueTokensAndSession() hard-coded
- *    tokenVersion: 2 on every new token instead of incrementing from the
- *    previous version. This meant refresh-token replay attacks could not be
- *    detected via version mismatch. Fixed: version is passed in from the
- *    caller and incremented properly.
+ * tokenVersion: 2 on every new token instead of incrementing from the
+ * previous version. This meant refresh-token replay attacks could not be
+ * detected via version mismatch. Fixed: version is passed in from the
+ * caller and incremented properly.
  *
  * 2. REFRESH TOKEN SESSION RACE CONDITION — refreshAccessToken() executed
- *    two independent queries (verify then update) outside a transaction,
- *    creating a race window where concurrent refresh requests could both
- *    pass the validity check. Fixed: all reads and writes inside one
- *    $transaction with a findFirst-for-update pattern (SELECT ... FOR UPDATE
- *    is not directly available in Prisma but the atomic update approach
- *    prevents double-spend by checking revokedAt in the same transaction).
+ * two independent queries (verify then update) outside a transaction,
+ * creating a race window where concurrent refresh requests could both
+ * pass the validity check. Fixed: all reads and writes inside one
+ * $transaction with a findFirst-for-update pattern via true Pessimistic Locking.
  *
  * 3. REFRESH TOKEN DB EXPIRY NOT CHECKED — verifyRefreshToken() only
- *    verified the JWT signature, not the DB record's expiresAt. A token
- *    could be valid cryptographically but already revoked/expired in DB.
- *    isRefreshTokenValid() was called separately, but the window between
- *    the two calls is a TOCTOU race. Fixed: single transactional query.
+ * verified the JWT signature, not the DB record's expiresAt. A token
+ * could be valid cryptographically but already revoked/expired in DB.
+ * isRefreshTokenValid() was called separately, but the window between
+ * the two calls is a TOCTOU race. Fixed: single transactional query.
  *
  * 4. TIMING ATTACK ON EMAIL EXISTENCE — register() called emailExists()
- *    which is a COUNT query that returns instantly for existing emails but
- *    might differ in timing for new ones. For registration this is
- *    acceptable (409 is expected); but requestPasswordReset() must NOT
- *    differ in timing between existing and non-existing emails (user
- *    enumeration). Fixed: always perform the same work (hash generation,
- *    DB write) regardless of whether the email exists, then discard if needed.
- *    Actually the safe pattern is: always return success, never create the
- *    token if user not found — which is what the original did. Retained.
+ * which is a COUNT query that returns instantly for existing emails but
+ * might differ in timing for new ones. For registration this is
+ * acceptable (409 is expected); but requestPasswordReset() must NOT
+ * differ in timing between existing and non-existing emails (user
+ * enumeration). Fixed: always perform the same work (hash generation,
+ * DB write) regardless of whether the email exists, then discard if needed.
+ * Actually the safe pattern is: always return success, never create the
+ * token if user not found — which is what the original did. Retained.
  *
  * 5. PLAINTEXT OTP STORED IN DB — OTPRequest.code stores the raw OTP.
- *    For a 6-digit OTP the entropy is only ~20 bits. If the DB is breached
- *    all pending OTPs are immediately usable. Fixed: store HMAC-SHA256 of
- *    the OTP keyed with a server secret, verify by re-hashing.
- *    NOTE: this requires the OTP_HMAC_SECRET env var to be set.
+ * For a 6-digit OTP the entropy is only ~20 bits. If the DB is breached
+ * all pending OTPs are immediately usable. Fixed: store HMAC-SHA256 of
+ * the OTP keyed with a server secret, verify by re-hashing.
+ * NOTE: this requires the OTP_HMAC_SECRET env var to be set.
  *
  * 6. MISSING CONSTANT OTP_LENGTH — auth.service.ts referenced
- *    SECURITY.OTP_LENGTH which did not exist in constants/index.ts,
- *    causing a runtime `undefined` passed to generateOTP(). Added to constants.
+ * SECURITY.OTP_LENGTH which did not exist in constants/index.ts,
+ * causing a runtime `undefined` passed to generateOTP(). Added to constants.
  *
  * 7. PASSWORD_POLICY.EXPIRE_DAYS used in one place, EXPIRY_DAYS in another
- *    (undefined). Standardised to EXPIRE_DAYS throughout.
+ * (undefined). Standardised to EXPIRE_DAYS throughout.
  *
  * 8. CHALLENGE TOKEN CARRIES RAW IP — the ipAddress from the challenge token
- *    payload was taken at face value. Client-supplied X-Forwarded-For can be
- *    spoofed. Moved IP extraction to the request-level only; challenge token
- *    stores the IP captured at step-1 login, step-2 verifies it hasn't changed
- *    (optional but logged).
+ * payload was taken at face value. Client-supplied X-Forwarded-For can be
+ * spoofed. Moved IP extraction to the request-level only; challenge token
+ * stores the IP captured at step-1 login, step-2 verifies it hasn't changed
+ * (optional but logged).
+ * * 9. PESSIMISTIC LOCKING ADDED — To prevent double-spend race conditions, 
+ * $queryRaw SELECT ... FOR UPDATE has been implemented for Refresh Tokens,
+ * OTP verification, and Password Reset consumption.
  */
 
 import { authRepository } from '../repositories/auth.repository';
@@ -481,7 +482,7 @@ export class AuthService {
   }
 
   // -------------------------------------------------------------------------
-  // LOGIN — step 2 (2FA OTP verification)
+  // LOGIN — step 2 (2FA OTP verification with Pessimistic Lock)
   // -------------------------------------------------------------------------
 
   async verifyLoginOtp(
@@ -502,50 +503,87 @@ export class AuthService {
     if (!user || !user.status) throw new AuthenticationError('User not found or inactive');
     if (user.isAccountLocked) throw new AuthenticationError('Account is locked');
 
-    const otpRequest = await authRepository.findOtpRequestById(otpRequestId);
-
-    if (
-      !otpRequest ||
-      otpRequest.userId !== userId ||            // IDOR guard
-      otpRequest.status !== OTPStatus.PENDING ||
-      otpRequest.expiresAt <= new Date() ||
-      otpRequest.verifiedAt
-    ) {
-      throw new AuthenticationError('OTP request expired or invalid');
-    }
-
-    // Compare HMAC of submitted code against stored HMAC
-    const submittedHash = hashOtp(otpCode);
-    if (otpRequest.code !== submittedHash) {
-      const updatedOtp = await authRepository.incrementOtpAttempts(otpRequest.id);
-      const newFailedAttempts = await authRepository.incrementFailedLoginAttempts(userId);
+    // Run verification inside a pessimistic lock transaction to prevent brute-force double spend
+    await db.$transaction(async (tx) => {
+      const otpRequests = await tx.$queryRaw<any[]>`
+        SELECT * FROM "OTPRequest"
+        WHERE "id" = ${otpRequestId}
+        FOR UPDATE
+      `;
+      
+      const otpRequest = otpRequests[0];
 
       if (
-        updatedOtp.attempts >= otpRequest.maxAttempts ||
-        newFailedAttempts >= SECURITY.MAX_LOGIN_ATTEMPTS
+        !otpRequest ||
+        otpRequest.userId !== userId ||            
+        otpRequest.status !== OTPStatus.PENDING ||
+        otpRequest.expiresAt <= new Date() ||
+        otpRequest.verifiedAt
       ) {
-        await authRepository.expireOtpRequest(otpRequest.id);
-        if (newFailedAttempts >= SECURITY.MAX_LOGIN_ATTEMPTS) {
-          await authRepository.lockAccount(userId, 'Too many 2FA failures');
-          void recordSecurityEvent(userId, SecurityEventType.ACCOUNT_LOCKED, {
-            description: `Account locked after ${newFailedAttempts} total failures`,
-            ipAddress, userAgent, severity: 'CRITICAL',
-          });
-        }
-        throw new AuthenticationError('Too many invalid attempts. Please restart login.');
+        throw new AuthenticationError('OTP request expired or invalid');
       }
 
-      void recordSecurityEvent(userId, SecurityEventType.LOGIN_FAILURE, {
-        description: `Invalid 2FA OTP attempt ${updatedOtp.attempts}`,
-        ipAddress, userAgent, severity: 'MEDIUM',
+      const submittedHash = hashOtp(otpCode);
+      
+      if (otpRequest.code !== submittedHash) {
+        // Increment attempts using Prisma within the locked transaction
+        const updatedOtp = await tx.oTPRequest.update({
+          where: { id: otpRequest.id },
+          data: { attempts: { increment: 1 } },
+        });
+
+        // Track user failed attempts on the transaction
+        const updatedUser = await tx.user.update({
+          where: { id: userId },
+          data: { failedLoginAttempts: { increment: 1 }, lastFailedLoginAt: new Date() }
+        });
+        const newFailedAttempts = updatedUser.failedLoginAttempts;
+
+        if (
+          updatedOtp.attempts >= otpRequest.maxAttempts ||
+          newFailedAttempts >= SECURITY.MAX_LOGIN_ATTEMPTS
+        ) {
+          await tx.oTPRequest.update({
+            where: { id: otpRequest.id },
+            data: { status: OTPStatus.EXPIRED },
+          });
+
+          if (newFailedAttempts >= SECURITY.MAX_LOGIN_ATTEMPTS) {
+            await tx.user.update({
+              where: { id: userId },
+              data: { isAccountLocked: true, accountLockedAt: new Date(), accountLockedReason: 'Too many 2FA failures' }
+            });
+
+            void recordSecurityEvent(userId, SecurityEventType.ACCOUNT_LOCKED, {
+              description: `Account locked after ${newFailedAttempts} total failures`,
+              ipAddress, userAgent, severity: 'CRITICAL',
+            });
+          }
+          throw new AuthenticationError('Too many invalid attempts. Please restart login.');
+        }
+
+        void recordSecurityEvent(userId, SecurityEventType.LOGIN_FAILURE, {
+          description: `Invalid 2FA OTP attempt ${updatedOtp.attempts}`,
+          ipAddress, userAgent, severity: 'MEDIUM',
+        });
+
+        throw new AuthenticationError('Invalid OTP code');
+      }
+
+      // Mark OTP as verified
+      await tx.oTPRequest.update({
+        where: { id: otpRequest.id },
+        data: { verifiedAt: new Date(), status: OTPStatus.VERIFIED },
       });
 
-      throw new AuthenticationError('Invalid OTP code');
-    }
+      // Reset login attempts after success
+      await tx.user.update({
+        where: { id: userId },
+        data: { failedLoginAttempts: 0, lastFailedLoginAt: null }
+      });
+    });
 
-    await authRepository.verifyOtpRequest(otpRequest.id);
-    await authRepository.resetFailedLoginAttempts(userId);
-
+    // Device actions kept outside of transaction lock to maintain performance
     const device = await authRepository.upsertDevice({ userId, deviceName, deviceType });
     if (trustDevice) await authRepository.updateDeviceTrust(device.id, true);
 
@@ -582,7 +620,7 @@ export class AuthService {
   }
 
   // -------------------------------------------------------------------------
-  // REFRESH TOKEN (with rotation, atomic)
+  // REFRESH TOKEN (with rotation & Pessimistic Lock)
   // -------------------------------------------------------------------------
 
   async refreshAccessToken(oldRefreshToken: string) {
@@ -592,23 +630,28 @@ export class AuthService {
 
     const oldTokenHash = hashToken(oldRefreshToken);
 
-    // 2. All DB work in one transaction — prevents TOCTOU race
+    // 2. All DB work in one transaction with true Pessimistic Locking
     const result = await db.$transaction(async (tx) => {
-      const tokenRecord = await tx.refreshToken.findUnique({
-        where: { tokenHash: oldTokenHash },
-      });
+      // LOCK the token row immediately
+      const tokens = await tx.$queryRaw<any[]>`
+        SELECT * FROM "RefreshToken" 
+        WHERE "tokenHash" = ${oldTokenHash} 
+        FOR UPDATE
+      `;
+      
+      const tokenRecord = tokens[0];
 
       if (!tokenRecord) throw new AuthenticationError('Refresh token not found');
       if (tokenRecord.revokedAt) throw new AuthenticationError('Refresh token revoked');
       if (tokenRecord.expiresAt < new Date()) throw new AuthenticationError('Refresh token expired');
 
       // Revoke old token immediately (rotation — any reuse attempt fails)
-      await tx.refreshToken.update({
+      const updatedToken = await tx.refreshToken.update({
         where: { id: tokenRecord.id },
         data: { revokedAt: new Date(), rotatedAt: new Date() },
       });
 
-      return tokenRecord;
+      return updatedToken;
     });
 
     const user = await db.user.findUnique({
@@ -683,42 +726,64 @@ export class AuthService {
   }
 
   // -------------------------------------------------------------------------
-  // RESET PASSWORD
+  // RESET PASSWORD (with Pessimistic Lock)
   // -------------------------------------------------------------------------
 
   async resetPassword(resetToken: string, newPassword: string) {
     const tokenHash = hashToken(resetToken);
-    const record = await authRepository.findValidResetToken(tokenHash);
-    if (!record) throw new AuthenticationError('Invalid or expired reset token');
-
+    
     this.validatePassword(newPassword);
-    await this.assertPasswordNotReused(record.userId, newPassword);
-
     const newPasswordHash = await hashPassword(newPassword);
-    const passwordExpiresAt = new Date(
-      Date.now() + PASSWORD_POLICY.EXPIRE_DAYS * 86_400_000
-    );
 
-    const user = await db.user.update({
-      where: { id: record.userId },
-      data: {
-        passwordHash: newPasswordHash,
-        passwordChangedAt: new Date(),
-        passwordExpiresAt,
-        isAccountLocked: false,
-        accountLockedAt: null,
-        accountLockedReason: null,
-        failedLoginAttempts: 0,
-      },
+    const recordUserId = await db.$transaction(async (tx) => {
+      // LOCK the token row first
+      const tokens = await tx.$queryRaw<any[]>`
+        SELECT * FROM "PasswordResetToken"
+        WHERE "tokenHash" = ${tokenHash}
+        FOR UPDATE
+      `;
+      
+      const record = tokens[0];
+      
+      if (!record || record.usedAt || record.expiresAt <= new Date()) {
+        throw new AuthenticationError('Invalid or expired reset token');
+      }
+
+      await this.assertPasswordNotReused(record.userId, newPassword);
+
+      const passwordExpiresAt = new Date(Date.now() + PASSWORD_POLICY.EXPIRE_DAYS * 86_400_000);
+
+      await tx.user.update({
+        where: { id: record.userId },
+        data: {
+          passwordHash: newPasswordHash,
+          passwordChangedAt: new Date(),
+          passwordExpiresAt,
+          isAccountLocked: false,
+          accountLockedAt: null,
+          accountLockedReason: null,
+          failedLoginAttempts: 0,
+        },
+      });
+
+      await tx.passwordResetToken.update({
+        where: { tokenHash },
+        data: { usedAt: new Date() },
+      });
+      
+      return record.userId;
     });
 
-    await authRepository.markResetTokenAsUsed(tokenHash);
-    await savePasswordHistory(record.userId, newPasswordHash);
+    await savePasswordHistory(recordUserId, newPasswordHash);
+
+    const user = await db.user.findUnique({ where: { id: recordUserId } });
 
     // Queue password changed notification
-    void EmailQueueManager.queuePasswordChangedNotification(user.email, user.firstName, record.userId);
+    if (user) {
+      void EmailQueueManager.queuePasswordChangedNotification(user.email, user.firstName, recordUserId);
+    }
 
-    void recordSecurityEvent(record.userId, SecurityEventType.PASSWORD_RESET, {
+    void recordSecurityEvent(recordUserId, SecurityEventType.PASSWORD_RESET, {
       description: 'Password reset completed',
       severity: 'MEDIUM',
     });

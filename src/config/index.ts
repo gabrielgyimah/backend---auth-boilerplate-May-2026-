@@ -80,6 +80,13 @@ const envSchema = z.object({
   REDIS_DB: z.coerce.number().default(0),
   REDIS_CACHE_TTL: z.coerce.number().default(3600),
 
+  // REDLOCK (distributed locking with Redis)
+  REDLOCK_RETRY_DELAY: z.coerce.number().default(200),
+  REDLOCK_RETRY_COUNT: z.coerce.number().default(10),
+  REDLOCK_DRIFT_FACTOR: z.coerce.number().default(0.01),
+  REDLOCK_RETRY_JITTER: z.coerce.number().default(50),
+  REDLOCK_TTL: z.coerce.number().default(10000),
+
   // Cloud Redis
   CLOUD_REDIS_HOST: z.string().optional(),
   CLOUD_REDIS_PORT: z.coerce.number().optional(),
